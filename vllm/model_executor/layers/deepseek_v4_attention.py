@@ -1470,6 +1470,10 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 # C128A: pre-computed during metadata build.
                 assert attn_metadata is not None
                 topk_indices = attn_metadata.c128a_prefill_topk_indices
+                if attn_metadata.c128a_prefill_effective_topk is not None:
+                    topk_indices = topk_indices[
+                        :, :attn_metadata.c128a_prefill_effective_topk
+                    ]
             top_k = topk_indices.shape[-1]
         else:
             # NOTE(woosuk): topk_indices will not be used for SWA-only layers.
