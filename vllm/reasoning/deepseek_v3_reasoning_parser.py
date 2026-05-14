@@ -35,10 +35,12 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
         thinking = thinking or enable_thinking
 
         self._parser: ReasoningParser
+        self._r1_parser = DeepSeekR1ReasoningParser(tokenizer, *args, **kwargs)
+        self._identity_parser = IdentityReasoningParser(tokenizer, *args, **kwargs)
         if thinking:
-            self._parser = DeepSeekR1ReasoningParser(tokenizer, *args, **kwargs)
+            self._parser = self._r1_parser
         else:
-            self._parser = IdentityReasoningParser(tokenizer, *args, **kwargs)
+            self._parser = self._identity_parser
 
     @property
     def reasoning_start_str(self) -> str | None:
@@ -49,12 +51,12 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
         return self._parser.reasoning_end_str
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
-        return self._parser.is_reasoning_end(input_ids)
+        return self._r1_parser.is_reasoning_end(input_ids)
 
     def is_reasoning_end_streaming(
         self, input_ids: Sequence[int], delta_ids: Iterable[int]
     ) -> bool:
-        return self._parser.is_reasoning_end_streaming(input_ids, delta_ids)
+        return self._r1_parser.is_reasoning_end_streaming(input_ids, delta_ids)
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
         return self._parser.extract_content_ids(input_ids)

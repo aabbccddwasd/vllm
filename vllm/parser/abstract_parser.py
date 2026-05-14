@@ -644,6 +644,26 @@ class DelegatingParser(Parser):
             return False
         return not state.reasoning_ended
 
+    def _expect_streamed_thinking_blocks(self) -> bool:
+        chat_kwargs = getattr(self, "_chat_template_kwargs", None) or {}
+        thinking = bool(chat_kwargs.get("thinking", False))
+        enable_thinking = bool(chat_kwargs.get("enable_thinking", False))
+        if thinking or enable_thinking:
+            return True
+        if (
+            chat_kwargs.get("thinking") is False
+            or chat_kwargs.get("enable_thinking") is False
+        ):
+            return False
+        if self._reasoning_parser is not None:
+            return getattr(self._reasoning_parser, "reasoning_start_str", None) is not None
+        return False
+
+    def _should_prefill_reasoning_ended_from_prompt(self) -> bool:
+        if self._tool_parser is None:
+            return True
+        return not self._expect_streamed_thinking_blocks()
+
     def _in_tool_call_phase(self, state: StreamState) -> bool:
         if self._tool_parser is None:
             return False
@@ -660,8 +680,9 @@ class DelegatingParser(Parser):
 
         if not state.prompt_reasoning_checked and prompt_token_ids is not None:
             state.prompt_reasoning_checked = True
-            if self._reasoning_parser is None or self.is_reasoning_end(
-                prompt_token_ids
+            if self._reasoning_parser is None or (
+                self._should_prefill_reasoning_ended_from_prompt()
+                and self.is_reasoning_end(prompt_token_ids)
             ):
                 state.reasoning_ended = True
 
@@ -754,6 +775,9 @@ class _WrappedParser(DelegatingParser):
         self, tokenizer: TokenizerLike, tools: list[Tool] | None = None, **kwargs
     ):
         super().__init__(tokenizer)
+        self._chat_template_kwargs: dict[str, object] | None = kwargs.get(
+            "chat_template_kwargs"
+        )
         # Instantiate the underlying parsers from class attributes
         if self.__class__.reasoning_parser_cls is not None:
             self._reasoning_parser = self.__class__.reasoning_parser_cls(
