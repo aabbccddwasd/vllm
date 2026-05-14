@@ -1229,10 +1229,18 @@ def accumulate_gathered_sparse_mla_attention_chunk(
         scale,
         HAS_SLOT_IDS=slot_ids is not None,
         BLOCK_D=block_d,
-        num_warps=8,
     )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=3),
+    ],
+    key=["num_candidates"],
+)
 @triton.jit
 def _accumulate_indexed_attention_chunk_kernel(
     q_ptr,
@@ -1372,10 +1380,18 @@ def accumulate_indexed_sparse_mla_attention_chunk(
         candidate_offset,
         scale,
         BLOCK_D=block_d,
-        num_warps=8,
     )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=3),
+    ],
+    key=["num_candidates"],
+)
 @triton.jit
 def _accumulate_fp8ds_global_slots_attention_chunk_kernel(
     q_ptr,
@@ -1557,10 +1573,18 @@ def accumulate_fp8ds_global_slots_sparse_mla_attention_chunk(
         candidate_offset,
         scale,
         BLOCK_D=block_d,
-        num_warps=8,
     )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=3),
+    ],
+    key=["num_candidates"],
+)
 @triton.jit
 def _accumulate_fp8ds_global_slots_attention_chunk_multihead_kernel(
     q_ptr,
@@ -1763,10 +1787,18 @@ def accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
         scale,
         HEAD_BLOCK=head_block_size,
         BLOCK_D=block_d,
-        num_warps=8,
     )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=3),
+    ],
+    key=["num_candidates"],
+)
 @triton.jit
 def _accumulate_fp8ds_paged_attention_chunk_kernel(
     q_ptr,
@@ -1951,10 +1983,18 @@ def accumulate_fp8ds_paged_sparse_mla_attention_chunk(
         candidate_offset,
         scale,
         BLOCK_D=block_d,
-        num_warps=8,
     )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=3),
+    ],
+    key=["num_candidates"],
+)
 @triton.jit
 def _accumulate_fp8ds_paged_attention_chunk_multihead_kernel(
     q_ptr,
@@ -1980,6 +2020,7 @@ def _accumulate_fp8ds_paged_attention_chunk_multihead_kernel(
     fp8_dim: tl.constexpr,
     scale_dim: tl.constexpr,
     quant_block: tl.constexpr,
+    num_tokens: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     num_candidates,
@@ -2153,6 +2194,7 @@ def accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
         token_fp8_dim,
         token_scale_dim,
         quant_block_size,
+        num_tokens,
         num_heads,
         head_dim,
         num_candidates,
@@ -2160,7 +2202,6 @@ def accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
         scale,
         HEAD_BLOCK=head_block_size,
         BLOCK_D=block_d,
-        num_warps=8,
     )
 
 
