@@ -112,7 +112,18 @@ def _deepseek_v4_mtp_uniform_decode_warmup_requests(
 
 def _deepseek_v4_slot_mapping_warmup(runner: "GPUModelRunner") -> None:
     max_tokens = getattr(runner, "max_num_tokens", 1)
-    block_table = runner.input_batch.block_table
+    # V1 runner stores input_batch directly; V2 runner uses execute_model_state
+    # which is only populated during actual execution, not during warmup.
+    # Skip this warmup step for V2; the shapes are covered by the sparse MLA
+    # warmup that follows.
+    if not hasattr(runner, "input_batch"):
+        logger.debug(
+            "Skipping DeepSeek V4 slot mapping warmup: "
+            "runner has no input_batch attribute (V2 model runner)."
+        )
+        return
+    input_batch = runner.input_batch
+    block_table = input_batch.block_table
 
     # Snapshot the runner buffers we mutate so warmup never leaks state into
     # the first real request.
