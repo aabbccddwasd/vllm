@@ -948,12 +948,19 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
         compressed_block_size = attn_metadata.block_size // self.compress_ratio
-        compressed_topk = topk_indices.shape[-1]
+        effective_topk = getattr(
+            attn_metadata, "c128a_decode_effective_topk", None
+        )
+        if effective_topk is not None and effective_topk > 0:
+            compressed_topk = min(effective_topk, topk_indices.shape[-1])
+            compressed_slot_ids = topk_indices[:, 0, :compressed_topk]
+        else:
+            compressed_topk = topk_indices.shape[-1]
+            compressed_slot_ids = topk_indices[:, 0, :]
         topk_chunk_size = min(
             compressed_topk,
             triton_sparse_mla_topk_chunk_size(),
         )
-        compressed_slot_ids = topk_indices[:, 0, :]
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
         swa_indices = swa_metadata.decode_swa_indices[:num_decode_tokens]
         head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
