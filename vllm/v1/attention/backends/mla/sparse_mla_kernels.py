@@ -971,6 +971,7 @@ def finish_materialized_sparse_mla_scores_with_sink(
 
     num_tokens, _, num_candidates = scores.shape
     head_dim = kv.shape[2]
+
     # Clamp BLOCK_D to the smallest power-of-2 >= head_dim (among the allowed
     # {64, 128, 256, 512}). Without this, a caller-supplied value_block_size
     # larger than head_dim wastes work on masked-off positions — e.g. DSv4
@@ -1397,6 +1398,195 @@ def accumulate_indexed_sparse_mla_attention_chunk(
         num_candidates,
         candidate_offset,
         scale,
+        BLOCK_D=block_d,
+    )
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=3),
+    ],
+    key=["num_candidates"],
+)
+@triton.jit
+def _accumulate_indexed_attention_chunk_multihead_kernel(
+    q_ptr,
+    kv_flat_ptr,
+    indices_ptr,
+    lens_ptr,
+    max_score_ptr,
+    denom_ptr,
+    acc_ptr,
+    stride_q_t: tl.constexpr,
+    stride_q_h: tl.constexpr,
+    stride_q_d: tl.constexpr,
+    stride_kv_t,
+    stride_kv_d: tl.constexpr,
+    stride_indices_t: tl.constexpr,
+    stride_indices_c: tl.constexpr,
+    stride_state_t: tl.constexpr,
+    stride_state_h: tl.constexpr,
+    stride_acc_t: tl.constexpr,
+    stride_acc_h: tl.constexpr,
+    stride_acc_d: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    num_candidates,
+    candidate_offset,
+    scale: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    head_block_idx = tl.program_id(1)
+    head_offsets = head_block_idx * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
+    dim_offsets = tl.arange(0, BLOCK_D)
+    head_mask = head_offsets < num_heads
+    dim_mask = dim_offsets < head_dim
+    matrix_mask = head_mask[:, None] & dim_mask[None, :]
+
+    q = tl.load(
+        q_ptr
+        + token_idx * stride_q_t
+        + head_offsets[:, None] * stride_q_h
+        + dim_offsets[None, :] * stride_q_d,
+        mask=matrix_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    state_offsets = token_idx * stride_state_t + head_offsets * stride_state_h
+    acc_offsets = (
+        token_idx * stride_acc_t
+        + head_offsets[:, None] * stride_acc_h
+        + dim_offsets[None, :] * stride_acc_d
+    )
+    running_max = tl.load(
+        max_score_ptr + state_offsets,
+        mask=head_mask,
+        other=-float("inf"),
+    )
+    running_denom = tl.load(
+        denom_ptr + state_offsets,
+        mask=head_mask,
+        other=0.0,
+    )
+    running_acc = tl.load(
+        acc_ptr + acc_offsets,
+        mask=matrix_mask,
+        other=0.0,
+    ).to(tl.float32)
+    valid_len = tl.load(lens_ptr + token_idx)
+    # Per-token early-loop-exit: ``lens[t] = topk_len_t + swa_len_t`` (set
+    # by combine_topk_swa_indices). Capping the loop at
+    # ``min(num_candidates, valid_len - candidate_offset)`` skips the dead
+    # tail. CUDA-graph-safe because ``lens_ptr`` is a stable address.
+    local_eff = tl.minimum(
+        num_candidates,
+        tl.maximum(valid_len - candidate_offset, 0),
+    )
+
+    for candidate_idx in range(0, local_eff):
+        kv_index = tl.load(
+            indices_ptr
+            + token_idx * stride_indices_t
+            + candidate_idx * stride_indices_c
+        )
+        is_valid = ((candidate_offset + candidate_idx) < valid_len) & (kv_index >= 0)
+
+        if is_valid:
+            # KV row loaded ONCE, reused across HEAD_BLOCK Q heads.
+            kv = tl.load(
+                kv_flat_ptr
+                + kv_index.to(tl.int64) * stride_kv_t
+                + dim_offsets * stride_kv_d,
+                mask=dim_mask,
+                other=0.0,
+            ).to(tl.float32)
+            score = tl.sum(q * kv[None, :], axis=1) * scale
+            next_max = tl.maximum(running_max, score)
+            previous_weight = tl.exp(running_max - next_max)
+            candidate_weight = tl.exp(score - next_max)
+            running_acc = (
+                running_acc * previous_weight[:, None]
+                + kv[None, :] * candidate_weight[:, None]
+            )
+            running_denom = running_denom * previous_weight + candidate_weight
+            running_max = next_max
+
+    tl.store(max_score_ptr + state_offsets, running_max, mask=head_mask)
+    tl.store(denom_ptr + state_offsets, running_denom, mask=head_mask)
+    tl.store(acc_ptr + acc_offsets, running_acc, mask=matrix_mask)
+
+
+def accumulate_indexed_sparse_mla_attention_chunk_multihead(
+    q: torch.Tensor,
+    kv_flat: torch.Tensor,
+    indices: torch.Tensor,
+    lens: torch.Tensor,
+    scale: float,
+    max_score: torch.Tensor,
+    denom: torch.Tensor,
+    acc: torch.Tensor,
+    candidate_offset: int = 0,
+    head_block_size: int = 4,
+) -> None:
+    if q.dim() == 4:
+        assert q.shape[1] == 1
+        q = q[:, 0]
+
+    assert q.dim() == 3, f"Expected q shape [T, H, D], got {q.shape}"
+    assert kv_flat.dim() == 2
+    assert indices.dim() == 2
+    assert indices.shape[0] == q.shape[0]
+    assert kv_flat.shape[-1] == q.shape[-1]
+    assert lens.shape[0] == q.shape[0]
+    assert max_score.shape[0] == q.shape[0]
+    assert max_score.shape[1] <= q.shape[1]
+    assert denom.shape == max_score.shape
+    assert acc.shape == (*max_score.shape, q.shape[-1])
+    assert max_score.dtype == torch.float32
+    assert denom.dtype == torch.float32
+    assert acc.dtype == torch.float32
+    assert q.is_cuda and kv_flat.is_cuda and indices.is_cuda and lens.is_cuda
+    assert max_score.is_cuda and denom.is_cuda and acc.is_cuda
+    assert head_block_size in (1, 2, 4), (
+        f"head_block_size must be 1, 2, or 4, got {head_block_size}"
+    )
+
+    num_tokens, _, head_dim = q.shape
+    num_heads = max_score.shape[1]
+    num_candidates = indices.shape[1]
+    block_d = min(1024, triton.next_power_of_2(head_dim))
+    grid = (num_tokens, triton.cdiv(num_heads, head_block_size))
+    _accumulate_indexed_attention_chunk_multihead_kernel[grid](
+        q,
+        kv_flat,
+        indices,
+        lens,
+        max_score,
+        denom,
+        acc,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        kv_flat.stride(0),
+        kv_flat.stride(1),
+        indices.stride(0),
+        indices.stride(1),
+        max_score.stride(0),
+        max_score.stride(1),
+        acc.stride(0),
+        acc.stride(1),
+        acc.stride(2),
+        num_heads,
+        head_dim,
+        num_candidates,
+        candidate_offset,
+        scale,
+        HEAD_BLOCK=head_block_size,
         BLOCK_D=block_d,
     )
 

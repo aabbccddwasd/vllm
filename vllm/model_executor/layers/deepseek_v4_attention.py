@@ -86,7 +86,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead,
     accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead,
-    accumulate_indexed_sparse_mla_attention_chunk,
+    accumulate_indexed_sparse_mla_attention_chunk_multihead,
     build_combined_sparse_mla_decode_valid_mask,
     choose_sparse_mla_splitkv_splits,
     finish_sparse_mla_attention_with_sink,
@@ -311,6 +311,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # [1] doubles as post-GEMM event1. Reuse is safe: GEMM fully joins
         # before post-GEMM starts.
         self.ln_events = [torch.cuda.Event() for _ in range(4)]
+        self.kv_done_event = torch.cuda.Event()
+        self.gather_done_event = torch.cuda.Event()
 
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
         self.swa_cache_layer = DeepseekV4SWACache(
@@ -520,7 +522,131 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # on the default stream so q stays on its consumer stream (mla_attn
         # downstream reads q on default). Indexer/compressor go on aux for
         # overlap with default's GEMM + cache write.
-        if self.indexer is not None:
+        #
+        # When C128A prefill tokens are present, launch the KV gather on an
+        # aux stream so it overlaps with the indexer forward. The pre-gathered
+        # KV workspace is passed to mla_attn so _forward_prefill can skip
+        # its own gather phases.
+        kv_workspace_for_prefill: torch.Tensor | None = None
+        _gather_overlap = (
+            isinstance(attn_metadata, dict)
+            and self.compress_ratio >= 128
+            and self.indexer is not None
+            and self.aux_stream_list is not None
+            and len(self.aux_stream_list) >= 2
+        )
+        if _gather_overlap:
+            _swa_m = cast(
+                "DeepseekSparseSWAMetadata",
+                attn_metadata.get(self.swa_cache_layer.prefix),
+            )
+            _gather_overlap = (
+                _swa_m is not None
+                and _swa_m.num_prefills > 0
+                and _swa_m.num_prefills <= PREFILL_CHUNK_SIZE
+            )
+        if _gather_overlap:
+            _swa_m = cast(
+                "DeepseekSparseSWAMetadata",
+                attn_metadata[self.swa_cache_layer.prefix],
+            )
+            _flashmla_m = cast(
+                FlashMLASparseMetadata | None,
+                attn_metadata.get(self.mla_attn.prefix),
+            )
+            assert _flashmla_m is not None, (
+                "C128A prefill requires FlashMLASparseMetadata"
+            )
+
+            # Compute gather workspace bounds.
+            _seq_lens_cpu = _swa_m.prefill_seq_lens_cpu
+            _gather_lens_cpu = _swa_m.prefill_gather_lens_cpu
+            assert _seq_lens_cpu is not None and _gather_lens_cpu is not None
+            _N = int((_seq_lens_cpu // self.compress_ratio).max().item())
+            _M = _N + int(_gather_lens_cpu.max().item())
+
+            # Allocate KV gather workspace.
+            (_kv_ws,) = current_workspace_manager().get_simultaneous(
+                ((PREFILL_CHUNK_SIZE, _M, self.mla_attn.head_dim), torch.bfloat16),
+            )
+            kv_workspace_for_prefill = _kv_ws
+
+            # --- DEFAULT + AUX 0 (indexer) ---
+            _comp = self.compressor
+            _idx = self.indexer
+            _aux0 = self.aux_stream_list[0]
+            _aux1 = self.aux_stream_list[1]
+            _positions = positions
+            _attn_metadata = attn_metadata
+            _rotary_emb = self.rotary_emb
+
+            def _wq_b_kv_insert_and_compress() -> torch.Tensor:
+                _q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                self._fused_qnorm_rope_kv_insert(
+                    _q,
+                    kv,
+                    _positions,
+                    _attn_metadata,
+                )
+                _comp(kv_score, _positions, _rotary_emb)
+                return _q
+
+            self.ln_events[0].record()
+            q = _wq_b_kv_insert_and_compress()
+            self.kv_done_event.record()
+
+            with torch.cuda.stream(_aux0):
+                self.ln_events[0].wait()
+                _idx(
+                    hidden_states,
+                    qr,
+                    indexer_kv_score,
+                    indexer_weights,
+                    _positions,
+                    self.indexer_rotary_emb,
+                )
+                self.ln_events[1].record()
+
+            # --- AUX 1 (KV gather) ---
+            _num_p = _swa_m.num_prefills
+            _num_d = _swa_m.num_decodes
+            _comp_k_cache = self.mla_attn.kv_cache
+            _swa_k_cache = self.swa_cache_layer.kv_cache
+            _seq_lens = _swa_m.prefill_seq_lens
+            _gather_lens = _swa_m.prefill_gather_lens
+            assert _seq_lens is not None and _gather_lens is not None
+            _block_t = _flashmla_m.block_table[_num_d:]
+            _comp_bs = _flashmla_m.block_size // self.compress_ratio
+            _swa_block_t = _swa_m.block_table[_num_d:]
+            _swa_bs = _swa_m.block_size
+
+            with torch.cuda.stream(_aux1):
+                self.kv_done_event.wait()
+                if _comp_k_cache is not None:
+                    dequantize_and_gather_k_cache(
+                        _kv_ws[:_num_p],
+                        _comp_k_cache,
+                        seq_lens=_seq_lens[:_num_p] // self.compress_ratio,
+                        gather_lens=None,
+                        block_table=_block_t[:_num_p],
+                        block_size=_comp_bs,
+                        offset=0,
+                    )
+                dequantize_and_gather_k_cache(
+                    _kv_ws[:_num_p],
+                    _swa_k_cache,
+                    seq_lens=_seq_lens[:_num_p],
+                    gather_lens=_gather_lens[:_num_p],
+                    block_table=_swa_block_t[:_num_p],
+                    block_size=_swa_bs,
+                    offset=_N,
+                )
+                self.gather_done_event.record()
+
+            self.ln_events[1].wait()
+            self.gather_done_event.wait()
+
+        elif self.indexer is not None:
             aux_stream = (
                 self.aux_stream_list[0] if self.aux_stream_list is not None else None
             )
@@ -576,6 +702,19 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Handle dummy run (no metadata).
         if not isinstance(attn_metadata, dict):
             out.zero_()
+            if self.compress_ratio >= 128:
+                try:
+                    _ws = current_workspace_manager()
+                except AssertionError:
+                    _ws = None
+                if _ws is not None:
+                    _m_bound = self.mla_attn._prefill_workspace_m_bound()
+                    _ws.get_simultaneous(
+                        (
+                            (PREFILL_CHUNK_SIZE, _m_bound, self.mla_attn.head_dim),
+                            torch.bfloat16,
+                        ),
+                    )
             self.mla_attn._reserve_prefill_workspace()
             return
 
@@ -586,7 +725,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
-        self.mla_attn(q, kv, positions, output=out)
+        self.mla_attn(
+            q, kv, positions, output=out, kv_workspace=kv_workspace_for_prefill
+        )
 
     def _fused_qnorm_rope_kv_insert(
         self,
@@ -778,6 +919,20 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             return int(indexer_topk)
         return _DEFAULT_SPARSE_MLA_TOPK_TOKENS
 
+    def _prefill_workspace_m_bound(self) -> int:
+        max_model_len = max(1, int(self.max_model_len))
+        max_num_batched_tokens = max(1, int(self.max_num_batched_tokens))
+        window_size = max(1, int(self.window_size))
+        compress_ratio = max(1, int(self.compress_ratio))
+        _, max_gather_len = _sparse_mla_prefill_gather_len_upper_bound(
+            max_model_len=max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
+            window_size=window_size,
+        )
+        if compress_ratio <= 1:
+            return max_gather_len
+        return (max_model_len // compress_ratio) + max_gather_len
+
     def _prefill_workspace_reservation_specs(
         self,
     ) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
@@ -948,9 +1103,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
         compressed_block_size = attn_metadata.block_size // self.compress_ratio
-        effective_topk = getattr(
-            attn_metadata, "c128a_decode_effective_topk", None
-        )
+        effective_topk = getattr(attn_metadata, "c128a_decode_effective_topk", None)
         if effective_topk is not None and effective_topk > 0:
             compressed_topk = min(effective_topk, topk_indices.shape[-1])
             compressed_slot_ids = topk_indices[:, 0, :compressed_topk]
@@ -1226,7 +1379,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     index_start + topk_chunk_size,
                     combined_indices.shape[-1],
                 )
-                accumulate_indexed_sparse_mla_attention_chunk(
+                accumulate_indexed_sparse_mla_attention_chunk_multihead(
                     q=q_chunk,
                     kv_flat=kv_flat,
                     indices=indices_chunk_full[:, index_start:index_end],
@@ -1254,6 +1407,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         kv: torch.Tensor,
         positions: torch.Tensor,
         output: torch.Tensor,
+        kv_workspace: torch.Tensor | None = None,
     ) -> None:
         assert output.shape == q.shape, (
             f"output buffer shape {output.shape} must match q shape {q.shape}"
@@ -1303,6 +1457,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 output=output[num_decode_tokens:],
                 attn_metadata=flashmla_metadata,
                 swa_metadata=swa_metadata,
+                kv_workspace=kv_workspace,
             )
         if num_decodes > 0:
             self._forward_decode(
@@ -1443,6 +1598,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         output: torch.Tensor,
         attn_metadata: FlashMLASparseMetadata | None,
         swa_metadata: "DeepseekSparseSWAMetadata",
+        kv_workspace: torch.Tensor | None = None,
     ) -> None:
         swa_only = attn_metadata is None
 
@@ -1479,7 +1635,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 topk_indices = attn_metadata.c128a_prefill_topk_indices
                 if attn_metadata.c128a_prefill_effective_topk is not None:
                     topk_indices = topk_indices[
-                        :, :attn_metadata.c128a_prefill_effective_topk
+                        :, : attn_metadata.c128a_prefill_effective_topk
                     ]
             top_k = topk_indices.shape[-1]
         else:
@@ -1545,35 +1701,39 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 ((max_query_chunk_tokens,), torch.int32),
             )
             prefill_state_buffers = None
+        _kv = kv_workspace if kv_workspace is not None else kv
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
             chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
             chunk_size = chunk_end - chunk_start
-            if not swa_only:
-                # Gather compressed KV
-                assert attn_metadata is not None
-                block_table = attn_metadata.block_table[num_decodes:]
+            if kv_workspace is None:
+                # Gather compressed + SWA KV into workspace. When
+                # kv_workspace is provided the wrapper's attention_impl
+                # has already run the gathers on an aux stream (overlapped
+                # with the indexer).
+                if not swa_only:
+                    assert attn_metadata is not None
+                    block_table = attn_metadata.block_table[num_decodes:]
+                    dequantize_and_gather_k_cache(
+                        kv[:chunk_size],
+                        compressed_k_cache,
+                        seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
+                        gather_lens=None,
+                        block_table=block_table[chunk_start:chunk_end],
+                        block_size=attn_metadata.block_size // self.compress_ratio,
+                        offset=0,
+                    )
+
+                swa_block_table = swa_metadata.block_table[num_decodes:]
                 dequantize_and_gather_k_cache(
                     kv[:chunk_size],
-                    compressed_k_cache,
-                    seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
-                    gather_lens=None,
-                    block_table=block_table[chunk_start:chunk_end],
-                    block_size=attn_metadata.block_size // self.compress_ratio,
-                    offset=0,
+                    swa_k_cache,
+                    seq_lens=seq_lens[chunk_start:chunk_end],
+                    gather_lens=gather_lens[chunk_start:chunk_end],
+                    block_table=swa_block_table[chunk_start:chunk_end],
+                    block_size=swa_metadata.block_size,
+                    offset=N,
                 )
-
-            # Gather SWA KV
-            swa_block_table = swa_metadata.block_table[num_decodes:]
-            dequantize_and_gather_k_cache(
-                kv[:chunk_size],
-                swa_k_cache,
-                seq_lens=seq_lens[chunk_start:chunk_end],
-                gather_lens=gather_lens[chunk_start:chunk_end],
-                block_table=swa_block_table[chunk_start:chunk_end],
-                block_size=swa_metadata.block_size,
-                offset=N,
-            )
 
             # Combine the topk indices and SWA indices for gathered KV cache
             query_start = (
@@ -1603,7 +1763,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             if triton_sparse_mla_enabled:
                 self._forward_sparse_mla_prefill_triton(
                     q=q[query_start:query_end],
-                    kv=kv[:chunk_size],
+                    kv=_kv[:chunk_size],
                     combined_indices=combined_indices,
                     combined_lens=combined_lens,
                     output=output[query_start:query_end],
@@ -1613,7 +1773,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
             flash_mla_sparse_fwd(
                 q=q[query_start:query_end],
-                kv=kv.view(-1, 1, q.shape[-1]),
+                kv=_kv.view(-1, 1, q.shape[-1]),
                 indices=combined_indices.unsqueeze(1),
                 sm_scale=self.scale,
                 attn_sink=self.attn_sink,
