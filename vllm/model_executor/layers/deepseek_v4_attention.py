@@ -4,7 +4,6 @@
 DeepseekV4 MLA Attention Layer
 """
 
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -386,60 +385,64 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
         # Attention (inside custom op for torch.compile boundary)
-        torch.ops.vllm.deepseek_v4_attention(
-            hidden_states,
-            positions,
-            o_padded,
-            self.layer_name,
-        )
+        monitor = get_perf_monitor()
+        with monitor.timing("attn.attention_op"):
+            torch.ops.vllm.deepseek_v4_attention(
+                hidden_states,
+                positions,
+                o_padded,
+                self.layer_name,
+            )
         o = o_padded[:, : self.n_local_heads, :]
 
         # Keep ROCm on the BF16 reference wo_a path util kernel ready.
         if current_platform.is_rocm():
-            z = rocm_inv_rope_einsum(
-                self.rotary_emb,
-                o,
-                positions,
-                self.rope_head_dim,
-                self.n_local_groups,
-                self.o_lora_rank,
-                self.wo_a,
-            )
-            return self.wo_b(z.flatten(1))
+            with monitor.timing("attn.o_proj"):
+                z = rocm_inv_rope_einsum(
+                    self.rotary_emb,
+                    o,
+                    positions,
+                    self.rope_head_dim,
+                    self.n_local_groups,
+                    self.o_lora_rank,
+                    self.wo_a,
+                )
+                return self.wo_b(z.flatten(1))
 
         # O projection: inverse RoPE + FP8 quant + einsum + wo_b
-        o_fp8, o_scale = fused_inv_rope_fp8_quant(
-            o,
-            positions,
-            self.rotary_emb.cos_sin_cache,
-            n_groups=self.n_local_groups,
-            heads_per_group=self.n_local_heads // self.n_local_groups,
-            nope_dim=self.nope_head_dim,
-            rope_dim=self.rope_head_dim,
-            tma_aligned_scales=self._tma_aligned_scales,
-        )
+        with monitor.timing("attn.o_proj"):
+            o_fp8, o_scale = fused_inv_rope_fp8_quant(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                n_groups=self.n_local_groups,
+                heads_per_group=self.n_local_heads // self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+                tma_aligned_scales=self._tma_aligned_scales,
+            )
 
-        wo_a_fp8 = self.wo_a.weight
-        wo_a_scale = self.wo_a.weight_scale_inv
+            wo_a_fp8 = self.wo_a.weight
+            wo_a_scale = self.wo_a.weight_scale_inv
 
-        z = _allocate_deepseek_v4_wo_a_output(
-            num_tokens,
-            self.n_local_groups,
-            self.o_lora_rank,
-            torch.bfloat16,
-            hidden_states.device,
-        )
-        torch.ops.vllm.deepseek_v4_fp8_einsum(
-            o_fp8,
-            o_scale,
-            wo_a_fp8,
-            wo_a_scale,
-            z,
-            "bhr,hdr->bhd",
-            list(self._einsum_recipe),
-        )
+            z = _allocate_deepseek_v4_wo_a_output(
+                num_tokens,
+                self.n_local_groups,
+                self.o_lora_rank,
+                torch.bfloat16,
+                hidden_states.device,
+            )
+            torch.ops.vllm.deepseek_v4_fp8_einsum(
+                o_fp8,
+                o_scale,
+                wo_a_fp8,
+                wo_a_scale,
+                z,
+                "bhr,hdr->bhd",
+                list(self._einsum_recipe),
+            )
 
-        return self.wo_b(z.flatten(1))
+            return self.wo_b(z.flatten(1))
 
     def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
         aux_streams = self.aux_stream_list
@@ -509,19 +512,22 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
+        monitor = get_perf_monitor()
 
-        qr_kv, kv_score, indexer_kv_score, indexer_weights = (
-            self.attn_gemm_parallel_execute(hidden_states)
-        )
+        with monitor.timing("attn.qkv_gemm"):
+            qr_kv, kv_score, indexer_kv_score, indexer_weights = (
+                self.attn_gemm_parallel_execute(hidden_states)
+            )
 
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
-        qr, kv = fused_q_kv_rmsnorm(
-            qr,
-            kv,
-            self.q_norm.weight.data,
-            self.kv_norm.weight.data,
-            self.eps,
-        )
+        with monitor.timing("attn.qkv_norm"):
+            qr, kv = fused_q_kv_rmsnorm(
+                qr,
+                kv,
+                self.q_norm.weight.data,
+                self.kv_norm.weight.data,
+                self.eps,
+            )
 
         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
         # on the default stream so q stays on its consumer stream (mla_attn
@@ -586,26 +592,31 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             _rotary_emb = self.rotary_emb
 
             def _wq_b_kv_insert_and_compress() -> torch.Tensor:
-                _q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-                self._fused_qnorm_rope_kv_insert(
-                    _q,
-                    kv,
-                    _positions,
-                    _attn_metadata,
-                )
-                _comp(kv_score, _positions, _rotary_emb)
+                with monitor.timing("attn.wq_b"):
+                    _q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                with monitor.timing("attn.kv_insert"):
+                    self._fused_qnorm_rope_kv_insert(
+                        _q,
+                        kv,
+                        _positions,
+                        _attn_metadata,
+                    )
+                with monitor.timing("attn.compressor"):
+                    _comp(kv_score, _positions, _rotary_emb)
                 return _q
 
             self.ln_events[0].record()
-            q = _wq_b_kv_insert_and_compress()
+            with monitor.timing("attn.wq_b_insert_compressor"):
+                q = _wq_b_kv_insert_and_compress()
             self.kv_done_event.record()
 
             with torch.cuda.stream(_aux0):
                 self.ln_events[0].wait()
-                _idx(
-                    hidden_states,
-                    qr,
-                    indexer_kv_score,
+                with monitor.timing("attn.indexer"):
+                    _idx(
+                        hidden_states,
+                        qr,
+                        indexer_kv_score,
                     indexer_weights,
                     _positions,
                     self.indexer_rotary_emb,
@@ -661,21 +672,25 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             compressor = self.compressor
 
             def wq_b_kv_insert_and_compress() -> torch.Tensor:
-                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-                self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
-                compressor(kv_score, positions, self.rotary_emb)
+                with monitor.timing("attn.wq_b"):
+                    q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                with monitor.timing("attn.kv_insert"):
+                    self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+                with monitor.timing("attn.compressor"):
+                    compressor(kv_score, positions, self.rotary_emb)
                 return q
 
-            q, _ = maybe_execute_in_parallel(
-                wq_b_kv_insert_and_compress,
-                lambda: indexer(
-                    hidden_states,
-                    qr,
-                    indexer_kv_score,
-                    indexer_weights,
-                    positions,
-                    self.indexer_rotary_emb,
-                ),
+            with monitor.timing("attn.indexer"):
+                q, _ = maybe_execute_in_parallel(
+                    wq_b_kv_insert_and_compress,
+                    lambda: indexer(
+                        hidden_states,
+                        qr,
+                        indexer_kv_score,
+                        indexer_weights,
+                        positions,
+                        self.indexer_rotary_emb,
+                    ),
                 self.ln_events[0],
                 self.ln_events[1],
                 aux_stream,
@@ -688,21 +703,26 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
-                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-                self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+                with monitor.timing("attn.wq_b"):
+                    q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                with monitor.timing("attn.kv_insert"):
+                    self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
 
-            q, _ = maybe_execute_in_parallel(
-                wq_b_kv_insert,
-                lambda: compressor(kv_score, positions, self.rotary_emb),
+            with monitor.timing("attn.compressor"):
+                q, _ = maybe_execute_in_parallel(
+                    wq_b_kv_insert,
+                    lambda: compressor(kv_score, positions, self.rotary_emb),
                 self.ln_events[0],
                 self.ln_events[1],
                 aux_stream,
             )
         else:
             # SWA-only layer: no compressor, no overlap.
-            q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-            self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+            with monitor.timing("attn.wq_b"):
+                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+            with monitor.timing("attn.kv_insert"):
+                self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
         # Handle dummy run (no metadata).
         if not isinstance(attn_metadata, dict):
@@ -1405,117 +1425,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             )
             if output.shape[1] > self.num_heads:
                 output[token_start:token_end, self.num_heads :].zero_()
-
-    def _forward_sparse_mla_prefill_triton_c128a(
-        self,
-        q: torch.Tensor,
-        kv: torch.Tensor,
-        positions: torch.Tensor,
-        combined_indices: torch.Tensor,
-        combined_lens: torch.Tensor,
-        output: torch.Tensor,
-        state_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
-        N: int = 0,
-        top_k: int = 0,
-        query_start_loc: torch.Tensor | None = None,
-    ) -> None:
-        """C128A/HCA prefill: dense blocked-matmul for both HCA + SWA, then merge.
-
-        ``kv`` is per-*request* ``[num_requests, M, head_dim]``.  The caller
-        provides ``query_start_loc`` (GPU, per-request cumulative token offsets
-        rebased to chunk-local) which the kernel uses to compute each token's
-        owning request row inline — zero copy, graph-safe.
-        """
-        num_tokens = q.shape[0]
-        num_heads = self.num_heads
-        head_dim = q.shape[-1]
-        combined_topk = combined_indices.shape[-1]
-        has_swa = combined_topk > top_k
-        workspace_manager = current_workspace_manager()
-        monitor = get_perf_monitor()
-
-        # Per-token compressed lens
-        comp_lens = ((positions + 1) // 128).int()
-        comp_lens = torch.clamp(comp_lens, max=top_k)
-
-        # Allocate state buffers
-        (
-            comp_max,
-            comp_denom,
-            comp_acc,
-            swa_max,
-            swa_denom,
-            swa_acc,
-        ) = workspace_manager.get_simultaneous(
-            ((num_tokens, num_heads), torch.float32),
-            ((num_tokens, num_heads), torch.float32),
-            ((num_tokens, num_heads, head_dim), torch.float32),
-            ((num_tokens, num_heads), torch.float32),
-            ((num_tokens, num_heads), torch.float32),
-            ((num_tokens, num_heads, head_dim), torch.float32),
-        )
-        comp_max.fill_(float("-inf"))
-        comp_denom.zero_()
-        comp_acc.zero_()
-        if has_swa:
-            swa_max.fill_(float("-inf"))
-            swa_denom.zero_()
-            swa_acc.zero_()
-
-        # Phase 1: dense blocked-matmul for compressed entries
-        with monitor.timing("attn.c128a.hca_dense"):
-            accumulate_dense_prefix_sparse_mla_attention_chunk_multihead(
-                q=q,
-                kv=kv[:, :N, :],
-                lens=comp_lens,
-                scale=self.scale,
-                max_score=comp_max,
-                denom=comp_denom,
-                acc=comp_acc,
-                num_candidates=top_k,
-                query_start_loc=query_start_loc,
-            )
-
-        if has_swa:
-            # Phase 2: dense blocked-matmul for SWA entries
-            swa_lens = torch.clamp(combined_lens - comp_lens, min=0)
-            with monitor.timing("attn.c128a.swa_dense"):
-                accumulate_dense_prefix_sparse_mla_attention_chunk_multihead(
-                    q=q,
-                    kv=kv[:, N:, :],
-                    lens=swa_lens,
-                    scale=self.scale,
-                    max_score=swa_max,
-                    denom=swa_denom,
-                    acc=swa_acc,
-                    num_candidates=kv.shape[1] - N,
-                    query_start_loc=query_start_loc,
-                )
-
-            with monitor.timing("attn.c128a.merge"):
-                finish_two_sparse_mla_attention_states_with_sink(
-                    comp_max,
-                    comp_denom,
-                    comp_acc,
-                    swa_max,
-                    swa_denom,
-                    swa_acc,
-                    self.attn_sink,
-                    output=output,
-                )
-        else:
-            with monitor.timing("attn.c128a.finish"):
-                finish_sparse_mla_attention_with_sink(
-                    comp_max,
-                    comp_denom,
-                    comp_acc,
-                    self.attn_sink,
-                    output=output,
-                )
-
-        if output.shape[1] > num_heads:
-            output[:, num_heads:].zero_()
-
     def forward(
         self,
         q: torch.Tensor,
@@ -1890,31 +1799,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             )
 
             if triton_sparse_mla_enabled:
-                if not swa_only and self.compress_ratio == 128 and top_k > 0 and not os.environ.get("VLLM_C128A_DENSE_DISABLE"):
-                    qsl_gpu = query_start_loc[
-                        num_decodes + chunk_start : num_decodes + chunk_end + 1
-                    ]
-                    # Pad to PREFILL_CHUNK_SIZE+1 entries (graph-safe fixed dim).
-                    if qsl_gpu.shape[0] < 5:
-                        qsl_last = qsl_gpu[-1]
-                        qsl_gpu = torch.cat(
-                            [qsl_gpu, qsl_last.expand(5 - qsl_gpu.shape[0])])
-                    with monitor.timing("attn.c128a"):
-                        self._forward_sparse_mla_prefill_triton_c128a(
-                            q=q[query_start:query_end],
-                            kv=_kv[:chunk_size],
-                            positions=positions[query_start:query_end],
-                            combined_indices=combined_indices,
-                            combined_lens=combined_lens,
-                            output=output[query_start:query_end],
-                            state_buffers=prefill_state_buffers,
-                            N=N,
-                            top_k=top_k,
-                            query_start_loc=qsl_gpu,
-                        )
-                else:
-                    with monitor.timing("attn.c128a.indexed"):
-                        self._forward_sparse_mla_prefill_triton(
+                with monitor.timing("attn.c128a.indexed"):
+                    self._forward_sparse_mla_prefill_triton(
                         q=q[query_start:query_end],
                         kv=_kv[:chunk_size],
                         combined_indices=combined_indices,

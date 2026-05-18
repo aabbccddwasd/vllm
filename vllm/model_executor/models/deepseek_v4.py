@@ -57,6 +57,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.v1.perf_monitor import get_perf_monitor
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -872,56 +873,64 @@ class DeepseekV4MoE(nn.Module):
         if not self.use_mega_moe:
             return self._forward_fused_moe(hidden_states, input_ids)
 
+        monitor = get_perf_monitor()
         org_shape = hidden_states.shape
-        router_logits, _ = self.gate(hidden_states)
-        topk_weights, topk_ids = fused_topk_bias(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            scoring_func=self.scoring_func,
-            e_score_correction_bias=self.gate.e_score_correction_bias.data
-            if self.gate.e_score_correction_bias is not None
-            else None,
-            topk=self.n_activated_experts,
-            renormalize=self.renormalize,
-            indices_type=self.hash_indices_dtype,
-            input_tokens=input_ids,
-            hash_indices_table=self.gate.tid2eid,
-            routed_scaling_factor=self.routed_scaling_factor,
-        )
+        with monitor.timing("ffn.gate"):
+            router_logits, _ = self.gate(hidden_states)
+            topk_weights, topk_ids = fused_topk_bias(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                scoring_func=self.scoring_func,
+                e_score_correction_bias=self.gate.e_score_correction_bias.data
+                if self.gate.e_score_correction_bias is not None
+                else None,
+                topk=self.n_activated_experts,
+                renormalize=self.renormalize,
+                indices_type=self.hash_indices_dtype,
+                input_tokens=input_ids,
+                hash_indices_table=self.gate.tid2eid,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
         activation_clamp = (
             float(self.swiglu_limit) if self.swiglu_limit is not None else None
         )
-        final_hidden_states = self.experts(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            activation_clamp=activation_clamp,
-        )
+        with monitor.timing("ffn.experts"):
+            final_hidden_states = self.experts(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                activation_clamp=activation_clamp,
+            )
 
         if self.shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
-            final_hidden_states += shared_output
+            with monitor.timing("ffn.shared_experts"):
+                shared_output = self.shared_experts(hidden_states)
+                final_hidden_states += shared_output
 
         return final_hidden_states.view(org_shape)
 
     def _forward_fused_moe(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
+        monitor = get_perf_monitor()
         org_shape = hidden_states.shape
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=hidden_states,
-                input_ids=input_ids,
-            )
+            with monitor.timing("ffn.experts"):
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states,
+                    router_logits=hidden_states,
+                    input_ids=input_ids,
+                )
         else:
-            router_logits, _ = self.gate(hidden_states)
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
+            with monitor.timing("ffn.gate"):
+                router_logits, _ = self.gate(hidden_states)
+            with monitor.timing("ffn.experts"):
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                )
 
         return final_hidden_states.view(org_shape)
 
@@ -1216,21 +1225,45 @@ class DeepseekV4DecoderLayer(nn.Module):
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        monitor = get_perf_monitor()
         if residual is None:
             # Run standalone hc_pre on first layer
             residual = x
-            x, post_mix, res_mix = self.hc_pre(
-                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
-            )
+            with monitor.timing("layer.hc_attn"):
+                x, post_mix, res_mix = self.hc_pre(
+                    x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+                )
         else:
+            with monitor.timing("layer.hc_attn"):
+                residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
+                    x,
+                    residual,
+                    post_mix,
+                    res_mix,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                )
+
+        with monitor.timing("layer.attn_norm"):
+            x = self.attn_norm(x)
+        with monitor.timing("layer.attn_total"):
+            x = self.attn(positions, x, None)
+
+        with monitor.timing("layer.hc_ffn"):
             residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
                 x,
                 residual,
                 post_mix,
                 res_mix,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
                 self.rms_norm_eps,
                 self.hc_eps,
                 self.hc_eps,
@@ -1238,26 +1271,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_sinkhorn_iters,
             )
 
-        x = self.attn_norm(x)
-        x = self.attn(positions, x, None)
-
-        residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
-            x,
-            residual,
-            post_mix,
-            res_mix,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-            self.hc_eps,
-            self.hc_post_alpha,
-            self.hc_sinkhorn_iters,
-        )
-
-        x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
+        with monitor.timing("layer.ffn_norm"):
+            x = self.ffn_norm(x)
+        with monitor.timing("layer.ffn_total"):
+            x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
 
     def _forward_rocm(
