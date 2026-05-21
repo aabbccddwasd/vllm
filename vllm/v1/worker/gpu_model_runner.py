@@ -24,6 +24,7 @@ import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
+from vllm.v1.perf_monitor import get_perf_monitor
 from vllm.config import (
     CompilationMode,
     CUDAGraphMode,
@@ -4130,13 +4131,23 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
+            # Perf monitor: record per-iteration GPU timing.
+            from vllm.v1.utils import compute_iteration_details
+            monitor = get_perf_monitor()
+            iter_details = compute_iteration_details(scheduler_output)
+            monitor.begin_iteration(
+                num_prefill_tokens=iter_details.num_ctx_tokens,
+                num_decode_tokens=iter_details.num_generation_tokens,
             )
+            with monitor.record_graph_timing("model.total"):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+            monitor.end_iteration()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
