@@ -1227,7 +1227,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             )
             return
 
-        if not mtp_decode and compressed_topk <= topk_chunk_size:
+        if compressed_topk <= topk_chunk_size:
             fp8ds_global_paged_sparse_mla_attention_with_sink_multihead(
                 q=q,
                 compressed_k_cache=compressed_k_cache,

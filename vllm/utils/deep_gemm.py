@@ -365,6 +365,25 @@ def fp8_fp4_mqa_topk_indices(
     )
 
 
+def _try_import_b12x_nsa_indexer():
+    """Lazily import the b12x NSA indexer; returns None if not available."""
+    try:
+        from b12x.attention.nsa_indexer.api import (
+            NSAIndexerExtendLogitsMetadata,
+            NSAIndexerPagedDecodeMetadata,
+            sparse_nsa_index_decode_logits_paged,
+            sparse_nsa_index_extend_logits,
+        )
+        return (
+            NSAIndexerExtendLogitsMetadata,
+            NSAIndexerPagedDecodeMetadata,
+            sparse_nsa_index_decode_logits_paged,
+            sparse_nsa_index_extend_logits,
+        )
+    except ImportError:
+        return None
+
+
 def _fp8_mqa_logits_sm12x(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -373,6 +392,28 @@ def _fp8_mqa_logits_sm12x(
     cu_seqlen_ke: torch.Tensor,
     clean_logits: bool,
 ) -> torch.Tensor:
+    q_values, q_scale = q
+    k_values, k_scales = kv
+
+    # Try b12x CuTe CUDA kernel first (faster, TMA-accelerated).
+    if q_scale is None and q_values.dim() == 3:
+        imported = _try_import_b12x_nsa_indexer()
+        if imported is not None:
+            _, _, _, sparse_nsa_index_extend_logits = imported
+            try:
+                metadata = imported[0](
+                    k_start=cu_seqlen_ks.contiguous(),
+                    k_end=cu_seqlen_ke.contiguous(),
+                )
+                return sparse_nsa_index_extend_logits(
+                    q_fp8=q_values,
+                    weights=weights,
+                    kv_fp8=(k_values.contiguous(), k_scales.contiguous()),
+                    metadata=metadata,
+                )
+            except Exception:
+                pass  # fall through to vLLM Triton fallback
+
     from vllm.v1.attention.ops.deepseek_v4_ops import sm12x_deep_gemm_fallbacks
 
     return sm12x_deep_gemm_fallbacks._fp8_mqa_logits_sm12x(
@@ -450,6 +491,32 @@ def get_paged_mqa_logits_metadata(
     return _get_paged_mqa_logits_metadata_impl(context_lens, block_size, num_sms)
 
 
+def _flatten_b12x_index_k_cache(kv_cache: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """Re-page b12x-compatible KV cache: block_size=64, 2D flat."""
+    if kv_cache.dtype != torch.uint8:
+        raise TypeError(f"Expected uint8 kv_cache for b12x, got {kv_cache.dtype}")
+    if kv_cache.dim() == 3:
+        num_blocks, block_size, head_dim_with_scale = kv_cache.shape
+        kv_pages = kv_cache.contiguous()
+    elif kv_cache.dim() == 4:
+        num_blocks, block_size, num_kv_heads, head_dim_with_scale = kv_cache.shape
+        if num_kv_heads != 1:
+            raise ValueError(f"Expected one KV head, got {num_kv_heads}")
+        kv_pages = kv_cache.contiguous().squeeze(2)
+    else:
+        raise ValueError(
+            f"Expected 3D or 4D kv_cache for b12x, got {kv_cache.dim()} dimensions")
+    if block_size > 64 and block_size % 64 == 0:
+        page_size = 64
+        page_factor = block_size // page_size
+        kv_pages = kv_pages.reshape(
+            num_blocks, page_factor, page_size, head_dim_with_scale
+        ).reshape(num_blocks * page_factor, page_size, head_dim_with_scale)
+    else:
+        page_size = block_size
+    return kv_pages.reshape(kv_pages.shape[0], page_size * head_dim_with_scale), page_size
+
+
 def _fp8_paged_mqa_logits_sm12x(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv_cache: torch.Tensor,
@@ -458,6 +525,11 @@ def _fp8_paged_mqa_logits_sm12x(
     block_tables: torch.Tensor,
     max_model_len: int,
 ) -> torch.Tensor:
+    # Keep decode on the vLLM Triton fallback.  b12x's paged-decode kernel is
+    # optimised for very long contexts and can be slower than Triton at short
+    # to medium lengths where the Triton rowwise kernel still fits full logits
+    # in L2 (~64 MB budget).  The prefill (unpaged) path does use b12x.
+
     from vllm.v1.attention.ops.deepseek_v4_ops import sm12x_deep_gemm_fallbacks
 
     return sm12x_deep_gemm_fallbacks._fp8_paged_mqa_logits_sm12x(

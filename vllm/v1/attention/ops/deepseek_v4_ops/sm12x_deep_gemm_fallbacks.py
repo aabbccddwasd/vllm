@@ -88,6 +88,101 @@ def _fp8_mqa_logits_torch(
     return logits
 
 
+def _fp8_mqa_logits_topk_triton_fused(
+    q_values: torch.Tensor,
+    k_values: torch.Tensor,
+    k_scales: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    topk_tokens: int,
+    out: torch.Tensor,
+) -> None:
+    """Fused FP8 indexer top-k path: one Triton kernel per K-chunk.
+
+    Replaces the head-chunk ``torch.matmul`` double-loop with a single
+    fused kernel that keeps QK+ReLU+weight+reduce in registers.  K is
+    still chunked for logits memory budget, but the per-chunk work is
+    a single launch.
+    """
+    from vllm.v1.attention.ops.deepseek_v4_ops.sm12x_mqa import (
+        fp8_mqa_logits_chunk_triton,
+    )
+
+    seq_len, _num_heads, _head_dim = q_values.shape
+    seq_len_kv = k_values.shape[0]
+
+    out.fill_(-1)
+    best_values = torch.full((seq_len, topk_tokens), float("-inf"),
+                             device=q_values.device, dtype=torch.float32)
+
+    # K-chunk size: the fused kernel has no per-head-chunk intermediate,
+    # so the only significant memory consumer is the output logits chunk
+    # [M, k_chunk] fp32.  Budget it directly instead of using the
+    # head-chunk-aware helper (which would drastically under-size the
+    # chunk when fed head_chunk_size=64).
+    max_logits_bytes = _SM120_MQA_LOGITS_MAX_SCORE_BYTES
+    k_chunk_size = min(seq_len_kv, max_logits_bytes // (seq_len * 4))
+    max_chunk_topk = min(topk_tokens, k_chunk_size)
+
+    # Reusable buffers for incremental topk merge
+    chunk_values_buf = torch.empty((seq_len, max_chunk_topk),
+                                   device=q_values.device, dtype=torch.float32)
+    # torch.topk requires int64 indices output.
+    chunk_indices_i64 = torch.empty((seq_len, max_chunk_topk),
+                                    device=q_values.device, dtype=torch.int64)
+    chunk_indices_i32 = torch.empty((seq_len, max_chunk_topk),
+                                    device=q_values.device, dtype=torch.int32)
+    candidate_values = torch.empty(
+        (seq_len, topk_tokens + max_chunk_topk),
+        device=q_values.device, dtype=torch.float32)
+    candidate_indices = torch.empty(
+        (seq_len, topk_tokens + max_chunk_topk),
+        device=q_values.device, dtype=torch.int32)
+    next_best_values = torch.empty_like(best_values)
+    selected = torch.empty((seq_len, topk_tokens),
+                           device=q_values.device, dtype=torch.int64)
+
+    for k_start in range(0, seq_len_kv, k_chunk_size):
+        k_end = min(k_start + k_chunk_size, seq_len_kv)
+
+        # Single fused kernel: all 64 heads, FP8 native, register accumulation
+        chunk_logits = fp8_mqa_logits_chunk_triton(
+            q_values, (k_values, k_scales), weights,
+            cu_seqlen_ks, cu_seqlen_ke, k_start, k_end,
+        )
+
+        # Causal mask
+        offsets = torch.arange(k_start, k_end, device=q_values.device)
+        valid = (offsets[None, :] >= cu_seqlen_ks[:, None]) & (
+            offsets[None, :] < cu_seqlen_ke[:, None])
+        chunk_logits.masked_fill_(~valid, float("-inf"))
+
+        chunk_topk = min(topk_tokens, k_end - k_start)
+        chunk_values = chunk_values_buf[:, :chunk_topk]
+        chunk_indices = chunk_indices_i64[:, :chunk_topk]
+        torch.topk(chunk_logits, chunk_topk, dim=1,
+                   out=(chunk_values, chunk_indices))
+        chunk_indices_i32_out = chunk_indices_i32[:, :chunk_topk]
+        chunk_indices_i32_out.copy_(chunk_indices)
+        chunk_indices_i32_out.add_(k_start)
+
+        candidate_cols = topk_tokens + chunk_topk
+        candidate_values_view = candidate_values[:, :candidate_cols]
+        candidate_indices_view = candidate_indices[:, :candidate_cols]
+        candidate_values_view[:, :topk_tokens].copy_(best_values)
+        candidate_values_view[:, topk_tokens:candidate_cols].copy_(chunk_values)
+        candidate_indices_view[:, :topk_tokens].copy_(out)
+        candidate_indices_view[:, topk_tokens:candidate_cols].copy_(
+            chunk_indices_i32_out)
+
+        torch.topk(candidate_values_view, topk_tokens, dim=1,
+                   out=(next_best_values, selected))
+        torch.gather(candidate_indices_view, 1, selected, out=out)
+        best_values, next_best_values = next_best_values, best_values
+        out.masked_fill_(~torch.isfinite(best_values), -1)
+
+
 def _fp8_mqa_logits_topk_torch(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -101,13 +196,8 @@ def _fp8_mqa_logits_topk_torch(
     if q_scale is not None:
         raise NotImplementedError("SM120 MQA top-k torch path only supports FP8 Q")
 
+    seq_len, _, _ = q_values.shape
     k_values, k_scales = kv
-    k_f32 = k_values.to(torch.float32)
-    k_f32.mul_(k_scales.reshape(-1, 1).to(torch.float32))
-    k_t = k_f32.transpose(0, 1).contiguous()
-
-    seq_len, num_heads, _ = q_values.shape
-    seq_len_kv = k_f32.shape[0]
     if out is None:
         out = torch.empty(
             (seq_len, topk_tokens), device=q_values.device, dtype=torch.int32
@@ -115,97 +205,10 @@ def _fp8_mqa_logits_topk_torch(
     else:
         assert out.shape == (seq_len, topk_tokens)
         assert out.dtype == torch.int32
-    out.fill_(-1)
 
-    best_values = torch.full(
-        (seq_len, topk_tokens),
-        float("-inf"),
-        device=q_values.device,
-        dtype=torch.float32,
-    )
-    head_chunk_size = _fp8_mqa_logits_head_chunk_size(seq_len, seq_len_kv, num_heads)
-    k_chunk_size = _fp8_mqa_logits_k_chunk_size(seq_len, seq_len_kv, head_chunk_size)
-    max_chunk_topk = min(topk_tokens, k_chunk_size)
-    chunk_values_buf = torch.empty(
-        (seq_len, max_chunk_topk),
-        device=q_values.device,
-        dtype=torch.float32,
-    )
-    chunk_indices_buf = torch.empty(
-        (seq_len, max_chunk_topk),
-        device=q_values.device,
-        dtype=torch.int64,
-    )
-    chunk_indices_i32 = torch.empty(
-        (seq_len, max_chunk_topk),
-        device=q_values.device,
-        dtype=torch.int32,
-    )
-    candidate_values = torch.empty(
-        (seq_len, topk_tokens + max_chunk_topk),
-        device=q_values.device,
-        dtype=torch.float32,
-    )
-    candidate_indices = torch.empty(
-        (seq_len, topk_tokens + max_chunk_topk),
-        device=q_values.device,
-        dtype=torch.int32,
-    )
-    next_best_values = torch.empty_like(best_values)
-    selected = torch.empty(
-        (seq_len, topk_tokens),
-        device=q_values.device,
-        dtype=torch.int64,
-    )
-
-    for k_start in range(0, seq_len_kv, k_chunk_size):
-        k_end = min(k_start + k_chunk_size, seq_len_kv)
-        chunk_logits = torch.zeros(
-            (seq_len, k_end - k_start),
-            device=q_values.device,
-            dtype=torch.float32,
-        )
-        for head_start in range(0, num_heads, head_chunk_size):
-            head_end = min(head_start + head_chunk_size, num_heads)
-            q_chunk = q_values[:, head_start:head_end, :].to(torch.float32)
-            q_chunk = q_chunk.transpose(0, 1).contiguous()
-            head_weights = weights[:, head_start:head_end].transpose(0, 1).unsqueeze(-1)
-            scores = torch.matmul(q_chunk, k_t[:, k_start:k_end])
-            scores.relu_()
-            scores.mul_(head_weights)
-            chunk_logits.add_(scores[0] if scores.shape[0] == 1 else scores.sum(dim=0))
-
-        offsets = torch.arange(k_start, k_end, device=q_values.device)
-        valid = (offsets[None, :] >= cu_seqlen_ks[:, None]) & (
-            offsets[None, :] < cu_seqlen_ke[:, None]
-        )
-        chunk_logits.masked_fill_(~valid, float("-inf"))
-
-        chunk_topk = min(topk_tokens, k_end - k_start)
-        chunk_values = chunk_values_buf[:, :chunk_topk]
-        chunk_indices = chunk_indices_buf[:, :chunk_topk]
-        torch.topk(chunk_logits, chunk_topk, dim=1, out=(chunk_values, chunk_indices))
-        chunk_indices_out = chunk_indices_i32[:, :chunk_topk]
-        chunk_indices_out.copy_(chunk_indices)
-        chunk_indices_out.add_(k_start)
-
-        candidate_cols = topk_tokens + chunk_topk
-        candidate_values_view = candidate_values[:, :candidate_cols]
-        candidate_indices_view = candidate_indices[:, :candidate_cols]
-        candidate_values_view[:, :topk_tokens].copy_(best_values)
-        candidate_values_view[:, topk_tokens:candidate_cols].copy_(chunk_values)
-        candidate_indices_view[:, :topk_tokens].copy_(out)
-        candidate_indices_view[:, topk_tokens:candidate_cols].copy_(chunk_indices_out)
-        torch.topk(
-            candidate_values_view,
-            topk_tokens,
-            dim=1,
-            out=(next_best_values, selected),
-        )
-        torch.gather(candidate_indices_view, 1, selected, out=out)
-        best_values, next_best_values = next_best_values, best_values
-        out.masked_fill_(~torch.isfinite(best_values), -1)
-
+    _fp8_mqa_logits_topk_triton_fused(
+        q_values, k_values, k_scales, weights,
+        cu_seqlen_ks, cu_seqlen_ke, topk_tokens, out)
     return out
 
 

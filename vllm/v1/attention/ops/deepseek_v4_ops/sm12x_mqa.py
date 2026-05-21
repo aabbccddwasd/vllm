@@ -98,25 +98,23 @@ def _fp8_mqa_logits_kernel(
         for d0 in tl.range(0, head_dim, BLOCK_D):
             d = d0 + offs_d
             q = tl.load(
-                q_ptr
-                + offs_m[:, None] * stride_qm
-                + h * stride_qh
-                + d[None, :] * stride_qd,
+                q_ptr + offs_m[:, None] * stride_qm
+                + h * stride_qh + d[None, :] * stride_qd,
                 mask=valid_m[:, None] & (d[None, :] < head_dim),
                 other=0.0,
-            ).to(tl.float32)
+            )
             k = tl.load(
-                k_ptr + offs_n[:, None] * stride_kn + d[None, :] * stride_kd,
+                k_ptr + offs_n[:, None] * stride_kn
+                + d[None, :] * stride_kd,
                 mask=valid_n[:, None] & (d[None, :] < head_dim),
                 other=0.0,
-            ).to(tl.float32)
-            scores += tl.dot(q, tl.trans(k), input_precision="tf32")
+            )
+            scores += tl.dot(q, tl.trans(k))
         scale = tl.load(scale_ptr + offs_n, mask=valid_n, other=0.0)
         weighted = tl.maximum(scores * scale[None, :], 0.0)
         weight = tl.load(
             weights_ptr + offs_m * stride_wm + h * stride_wh,
-            mask=valid_m,
-            other=0.0,
+            mask=valid_m, other=0.0,
         )
         logits += weighted * weight[:, None]
 
@@ -135,6 +133,8 @@ def fp8_mqa_logits_triton(
     weights: torch.Tensor,
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
+    block_m: int | None = None,
+    num_warps: int = 4,
 ) -> torch.Tensor:
     k_fp8, scale = kv
     num_q, num_heads, head_dim = q.shape
@@ -147,7 +147,12 @@ def fp8_mqa_logits_triton(
     if num_q == 0 or seq_len_kv == 0:
         return logits
 
-    grid = (triton.cdiv(num_q, 8), triton.cdiv(seq_len_kv, 64))
+    # Adaptive BLOCK_M: larger tiles improve FP8 tensor core utilisation
+    # for prefill batches but waste work for tiny decode batches.
+    if block_m is None:
+        block_m = 16 if num_q <= 16 else 32
+
+    grid = (triton.cdiv(num_q, block_m), triton.cdiv(seq_len_kv, 64))
     _fp8_mqa_logits_kernel[grid](
         q,
         k_fp8,
@@ -169,10 +174,245 @@ def fp8_mqa_logits_triton(
         weights.stride(1),
         logits.stride(0),
         logits.stride(1),
-        BLOCK_M=8,
+        BLOCK_M=block_m,
         BLOCK_N=64,
         BLOCK_D=64,
-        num_warps=4,
+        num_warps=num_warps,
+    )
+    return logits
+
+
+@triton.autotune(
+    configs=[
+        # BLOCK_M=32 family (current best)
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'num_stages': 2}, num_warps=4),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'num_stages': 3}, num_warps=4),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'num_stages': 4}, num_warps=4),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'num_stages': 2}, num_warps=4),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'num_stages': 3}, num_warps=4),
+        # BLOCK_M=64 family
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'num_stages': 2}, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'num_stages': 3}, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'num_stages': 2}, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'num_stages': 3}, num_warps=4),
+        # BLOCK_M=16 with larger N
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'num_stages': 2}, num_warps=4),
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'num_stages': 3}, num_warps=4),
+        # num_warps=8 variants (only if registers permit)
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'num_stages': 2}, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'num_stages': 2}, num_warps=8),
+    ],
+    key=['num_q', 'seq_len_kv'],
+    reset_to_zero=[],
+    warmup=5,
+    rep=20,
+)
+@triton.jit
+def _fp8_mqa_logits_kernel_autotuned(
+    q_ptr,
+    k_ptr,
+    scale_ptr,
+    weights_ptr,
+    cu_seqlen_ks_ptr,
+    cu_seqlen_ke_ptr,
+    logits_ptr,
+    num_q: tl.constexpr,
+    seq_len_kv: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    stride_qm: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qd: tl.constexpr,
+    stride_kn: tl.constexpr,
+    stride_kd: tl.constexpr,
+    stride_wm: tl.constexpr,
+    stride_wh: tl.constexpr,
+    stride_lm: tl.constexpr,
+    stride_ln: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr = 64,
+    num_stages: tl.constexpr = 2,
+):
+
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    valid_m = offs_m < num_q
+    valid_n = offs_n < seq_len_kv
+    seq_start = tl.load(cu_seqlen_ks_ptr + offs_m, mask=valid_m, other=0)
+    seq_end = tl.load(cu_seqlen_ke_ptr + offs_m, mask=valid_m, other=0)
+    seq_mask = (offs_n[None, :] >= seq_start[:, None]) & (
+        offs_n[None, :] < seq_end[:, None]
+    )
+
+    logits = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for h in tl.range(0, num_heads):
+        scores = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for d0 in tl.range(0, head_dim, BLOCK_D):
+            d = d0 + offs_d
+            q = tl.load(
+                q_ptr + offs_m[:, None] * stride_qm
+                + h * stride_qh + d[None, :] * stride_qd,
+                mask=valid_m[:, None] & (d[None, :] < head_dim),
+                other=0.0,
+            )
+            k = tl.load(
+                k_ptr + offs_n[:, None] * stride_kn
+                + d[None, :] * stride_kd,
+                mask=valid_n[:, None] & (d[None, :] < head_dim),
+                other=0.0,
+            )
+            scores += tl.dot(q, tl.trans(k))
+        scale = tl.load(scale_ptr + offs_n, mask=valid_n, other=0.0)
+        weighted = tl.maximum(scores * scale[None, :], 0.0)
+        weight = tl.load(
+            weights_ptr + offs_m * stride_wm + h * stride_wh,
+            mask=valid_m, other=0.0,
+        )
+        logits += weighted * weight[:, None]
+
+    store_mask = valid_m[:, None] & valid_n[None, :]
+    logits = tl.where(seq_mask & store_mask, logits, float("-inf"))
+    tl.store(
+        logits_ptr + offs_m[:, None] * stride_lm + offs_n[None, :] * stride_ln,
+        logits,
+        mask=store_mask,
+    )
+
+
+def fp8_mqa_logits_triton_autotuned(
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    kv_start: int = 0,
+    kv_end: int | None = None,
+) -> torch.Tensor:
+    """Autotuned fused FP8 MQA logits kernel.
+
+    Uses ``@triton.autotune`` over BLOCK_M ∈ {16,32,64},
+    BLOCK_N ∈ {32,64,128}, num_warps ∈ {4,8}, num_stages ∈ {2,3,4}.
+    Best config cached per (num_q, seq_len_kv) key after warmup.
+    """
+    k_fp8, scale = kv
+    num_q, num_heads, head_dim = q.shape
+    seq_len_kv = k_fp8.shape[0]
+
+    if kv_end is None:
+        kv_end = seq_len_kv
+    kv_chunk_len = kv_end - kv_start
+
+    logits = torch.empty(
+        (num_q, kv_chunk_len), device=q.device, dtype=torch.float32,
+    )
+    if num_q == 0 or kv_chunk_len == 0:
+        return logits
+
+    k_chunk = k_fp8[kv_start:kv_end]
+    scale_chunk = scale[kv_start:kv_end]
+    cu_ks_adj = torch.clamp(cu_seqlen_ks - kv_start, min=0)
+    cu_ke_adj = torch.clamp(cu_seqlen_ke - kv_start, min=0, max=kv_chunk_len)
+
+    grid = lambda META: (
+        triton.cdiv(num_q, META['BLOCK_M']),
+        triton.cdiv(kv_chunk_len, META['BLOCK_N']),
+    )
+    _fp8_mqa_logits_kernel_autotuned[grid](
+        q,
+        k_chunk,
+        scale_chunk,
+        weights,
+        cu_ks_adj,
+        cu_ke_adj,
+        logits,
+        num_q,
+        kv_chunk_len,
+        num_heads,
+        head_dim,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k_chunk.stride(0),
+        k_chunk.stride(1),
+        weights.stride(0),
+        weights.stride(1),
+        logits.stride(0),
+        logits.stride(1),
+    )
+    return logits
+
+
+def fp8_mqa_logits_chunk_triton(
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    kv_start: int,
+    kv_end: int,
+    block_m: int | None = None,
+    num_warps: int = 4,
+) -> torch.Tensor:
+    """Produce logits for a K-chunk ``[kv_start, kv_end)``.
+
+    Equivalent to the head-chunk loop in ``_fp8_mqa_logits_topk_torch`` but
+    fuses all 64 heads into a single kernel launch with register-level
+    accumulation, eliminating the per-head-chunk intermediate fp32 writes.
+    """
+    k_fp8, scale = kv
+    num_q, num_heads, head_dim = q.shape
+    kv_chunk_len = kv_end - kv_start
+    logits = torch.empty(
+        (num_q, kv_chunk_len),
+        device=q.device,
+        dtype=torch.float32,
+    )
+    if num_q == 0 or kv_chunk_len == 0:
+        return logits
+
+    # Adaptive BLOCK_M
+    if block_m is None:
+        block_m = 16 if num_q <= 16 else 32
+
+    # Slice K and scale to the requested window
+    k_chunk = k_fp8[kv_start:kv_end]
+    scale_chunk = scale[kv_start:kv_end]
+
+    # Adjust cu_seqlen so causal masking is relative to the chunk
+    cu_seqlen_ks_adj = torch.clamp(cu_seqlen_ks - kv_start, min=0)
+    cu_seqlen_ke_adj = torch.clamp(cu_seqlen_ke - kv_start, min=0, max=kv_chunk_len)
+
+    grid = (triton.cdiv(num_q, block_m), triton.cdiv(kv_chunk_len, 64))
+    _fp8_mqa_logits_kernel[grid](
+        q,
+        k_chunk,
+        scale_chunk,
+        weights,
+        cu_seqlen_ks_adj,
+        cu_seqlen_ke_adj,
+        logits,
+        num_q,
+        kv_chunk_len,
+        num_heads,
+        head_dim,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k_chunk.stride(0),
+        k_chunk.stride(1),
+        weights.stride(0),
+        weights.stride(1),
+        logits.stride(0),
+        logits.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=64,
+        BLOCK_D=64,
+        num_warps=num_warps,
     )
     return logits
 
