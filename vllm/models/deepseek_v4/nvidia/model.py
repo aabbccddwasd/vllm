@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import typing
-from collections.abc import Callable, Iterable
+from collections import OrderedDict
+from collections.abc import Callable, Iterable, MutableSequence, Sequence
 from itertools import islice
 
 import regex as re
@@ -635,6 +636,11 @@ class DeepseekV4MoE(nn.Module):
                 f"{config.expert_dtype!r}. Drop --kernel-config moe_backend="
                 "deep_gemm_mega_moe for this checkpoint."
             )
+        # Per-layer MegaMoE disable: FP8 expert layers cannot use MegaMoE.
+        if self.use_mega_moe:
+            fp8_layers = set(getattr(config, "fp8_expert_layers", []))
+            if extract_layer_index(prefix) in fp8_layers:
+                self.use_mega_moe = False
 
         self.gate = GateLinear(
             input_size=config.hidden_size,
@@ -1355,7 +1361,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         name_mapped = name.replace(weight_name, param_name)
                         if is_pp_missing_parameter(name_mapped, self):
                             continue
-                        param = params_dict[name_mapped]
+                        try:
+                            param = params_dict[name_mapped]
+                        except KeyError:
+                            # FP8 expert layers register scale params with
+                            # ``_inv`` suffix (e.g. w13_weight_scale_inv).
+                            if "_weight_scale" in name_mapped:
+                                name_mapped = name_mapped + "_inv"
+                                param = params_dict[name_mapped]
+                            else:
+                                raise
                         # We should ask the weight loader to return success or not
                         # here since otherwise we may skip experts with other
                         # available replicas.
@@ -1437,20 +1452,36 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             layer.ffn.finalize_mega_moe_weights()
 
 
-def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
-    if expert_dtype == "fp4":
-        # MXFP4 experts use Mxfp4MoEMethod, which registers scales as
-        # ``w{1,2,3}_weight_scale`` (no _inv suffix). FP8 linear and
-        # shared experts use Fp8LinearMethod's block scales, which
-        # register as ``weight_scale_inv``.
+def _make_deepseek_v4_weights_mapper(
+    expert_dtype: str,
+    fp8_expert_layers: set[int] | None = None,
+) -> WeightsMapper:
+    fp8_expert_layers = fp8_expert_layers or set()
+
+    if expert_dtype == "fp4" and fp8_expert_layers:
+        # Mixed precision: FP8 expert layers use weight_scale_inv,
+        # FP4 expert layers use weight_scale (no _inv).
+        # Ordered regex ensures FP8-specific rule matches first.
+        layers_str = "|".join(str(l) for l in sorted(fp8_expert_layers))
+        scale_regex = OrderedDict()
+        scale_regex[re.compile(
+            rf"(\.layers\.({layers_str})\.ffn\.experts\.\d+\.w[123])\.scale$"
+        )] = r"\1.weight_scale_inv"
+        scale_regex[re.compile(
+            r"(\.experts\.\d+\.w[123])\.scale$"
+        )] = r"\1.weight_scale"
+        scale_regex[re.compile(r"\.scale$")] = ".weight_scale_inv"
+    elif expert_dtype == "fp4":
+        # Pure FP4: MXFP4 experts use Mxfp4MoEMethod, which registers
+        # scales as ``w{1,2,3}_weight_scale`` (no _inv suffix). FP8
+        # linear and shared experts use Fp8LinearMethod's block scales,
+        # which register as ``weight_scale_inv``.
         scale_regex = {
             re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
             re.compile(r"\.scale$"): ".weight_scale_inv",
         }
     else:
-        # FP8 experts use Fp8MoEMethod (block_quant=True), which registers
-        # scales as ``w{13,2}_weight_scale_inv``. Map all ``.scale`` keys
-        # there.
+        # Pure FP8: all .scale -> weight_scale_inv
         scale_regex = {
             re.compile(r"\.scale$"): ".weight_scale_inv",
         }
@@ -1526,8 +1557,11 @@ class DeepseekV4ForCausalLM(
         config = vllm_config.model_config.hf_config
         self.config = config
         expert_dtype = getattr(config, "expert_dtype", "fp4")
-        if expert_dtype != "fp4":
-            self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(expert_dtype)
+        fp8_expert_layers = set(getattr(config, "fp8_expert_layers", []))
+        if expert_dtype != "fp4" or fp8_expert_layers:
+            self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(
+                expert_dtype, fp8_expert_layers,
+            )
 
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")

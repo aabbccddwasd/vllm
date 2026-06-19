@@ -17,6 +17,7 @@ from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
+from vllm.model_executor.models.utils import extract_layer_index
 
 _DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8")
 
@@ -51,6 +52,9 @@ class DeepseekV4FP8Config(Fp8Config):
         self._resolved_expert_dtype: str | None = None
         self._resolved_moe_quant_algo: str | None = None
         self._nvfp4_config: ModelOptNvFp4Config | None = None
+        self._fp8_expert_layers: set[int] = set()
+        self._default_dtype: str = "fp4"
+        self._initialized: bool = False
         # ``is_scale_e8m0`` is a property that resolves on first read,
         # by which time the current vllm_config has been set.
 
@@ -76,6 +80,30 @@ class DeepseekV4FP8Config(Fp8Config):
                 "DeepSeek V4 expert_dtype resolved to %r", expert_dtype
             )
         return self._resolved_expert_dtype
+
+    def _lazy_init(self):
+        if self._initialized:
+            return
+        try:
+            hf_config = get_current_vllm_config().model_config.hf_config
+        except Exception:
+            return
+        self._fp8_expert_layers = set(
+            getattr(hf_config, "fp8_expert_layers", []))
+        self._default_dtype = getattr(hf_config, "expert_dtype", "fp4")
+        self._initialized = True
+        if self._fp8_expert_layers:
+            from vllm.logger import init_logger
+            init_logger(__name__).info(
+                "DeepSeek V4 fp8_expert_layers=%r, default=%r",
+                sorted(self._fp8_expert_layers), self._default_dtype,
+            )
+
+    def _resolve_expert_dtype(self, layer_idx: int | None) -> str:
+        self._lazy_init()
+        if layer_idx is not None and layer_idx in self._fp8_expert_layers:
+            return "fp8"
+        return self._default_dtype
 
     @property
     def is_scale_e8m0(self) -> bool:
@@ -139,7 +167,8 @@ class DeepseekV4FP8Config(Fp8Config):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
-            if self.expert_dtype == "fp4":
+            layer_idx = extract_layer_index(prefix)
+            if self._resolve_expert_dtype(layer_idx) == "fp4":
                 if self.moe_quant_algo == "NVFP4":
                     from vllm.model_executor.layers.quantization.modelopt import (
                         ModelOptNvFp4FusedMoE,
@@ -157,4 +186,5 @@ class DeepseekV4FP8Config(Fp8Config):
     def is_mxfp4_quant(self, prefix, layer):
         if not isinstance(layer, RoutedExperts) or self.expert_dtype != "fp4":
             return False
-        return self.moe_quant_algo != "NVFP4"
+        layer_idx = extract_layer_index(prefix)
+        return self._resolve_expert_dtype(layer_idx) == "fp4"

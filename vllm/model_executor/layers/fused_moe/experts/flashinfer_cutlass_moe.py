@@ -168,6 +168,9 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
                 and p.has_device_capability(90)
             )
             # fp8 block-scale, wmxfp4a16 on 9.0
+            # SM120 Blackwell: FlashInfer CUTLASS FP8 MoE kernel not
+            # implemented (reports "FP8 block scaling not yet implemented
+            # for Blackwell.") -- use TRITON fallback.
             or (
                 scheme
                 in [
