@@ -1010,6 +1010,10 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
         del runner.kv_cache_config
     # Dropping the manager releases the profiling graphs and throwaway pool.
     runner.cudagraph_manager = None
+    # The zeroer precomputed absolute addresses of the profiling KV tensors that
+    # are released below, so one surviving this teardown would write through
+    # dangling memory. _init_kv_zero_meta() rebuilds it against the real cache.
+    runner.kv_block_zeroer = None
     # Release encoder graphs captured during profiling; the real
     # capture_model() re-captures them.
     if runner.model_state.supports_mm_inputs:

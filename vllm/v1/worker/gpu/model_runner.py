@@ -177,6 +177,7 @@ from vllm.v1.worker.utils import (
     clear_layer_kv_caches,
     copy_kv_cache_blocks_inplace,
     get_uniform_decode_token_count,
+    zero_captured_kv_caches,
 )
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
@@ -1046,6 +1047,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
         if not profile_only:
+            # Capture wrote through an all-zero block table, so block 0 may hold
+            # capture activations; the sparse-MLA kernels gather it for masked
+            # entries and `0 * NaN` survives the mask. Restore it before serving.
+            zero_captured_kv_caches(
+                self.kv_caches, full=envs.VLLM_ZERO_ALL_KV_AFTER_CAPTURE
+            )
             # Lock workspace to prevent resizing during execution. A resize after
             # capture frees the static cuda graph buffer.
             lock_workspace()

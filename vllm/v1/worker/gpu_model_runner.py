@@ -230,6 +230,7 @@ from vllm.v1.worker.utils import (
     EncoderTimingStats,
     is_residual_scattered_for_sp,
     raise_if_nan_logits,
+    zero_captured_kv_caches,
 )
 from vllm.v1.worker.workspace import lock_workspace
 
@@ -6919,6 +6920,13 @@ class GPUModelRunner(
 
         torch.accelerator.synchronize()
         torch.accelerator.empty_cache()
+
+        # Capture wrote through an all-zero block table, so block 0 may hold
+        # capture activations; the sparse-MLA kernels gather it for masked
+        # entries and `0 * NaN` survives the mask. Restore it before serving.
+        zero_captured_kv_caches(
+            self.kv_caches, full=envs.VLLM_ZERO_ALL_KV_AFTER_CAPTURE
+        )
 
         # Lock workspace to prevent resizing during execution.
         # Max workspace sizes should have been captured during warmup/profiling.

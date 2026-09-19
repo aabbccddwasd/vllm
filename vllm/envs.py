@@ -259,6 +259,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB: int | None = None
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
+    VLLM_ZERO_ALL_KV_AFTER_CAPTURE: bool = False
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
@@ -1835,6 +1836,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set to 1, allows GC to run during capture.
     "VLLM_ENABLE_CUDAGRAPH_GC": lambda: bool(
         int(os.getenv("VLLM_ENABLE_CUDAGRAPH_GC", "0"))
+    ),
+    # Zero whole KV caches instead of only the reserved null block after CUDA
+    # graph capture. Capture whose dummy slot mappings reach real pages can leave
+    # non-finite rows there; the default (0) restores block 0 only.
+    "VLLM_ZERO_ALL_KV_AFTER_CAPTURE": lambda: bool(
+        int(os.getenv("VLLM_ZERO_ALL_KV_AFTER_CAPTURE", "0"))
     ),
     # Used to force set up loopback IP
     "VLLM_LOOPBACK_IP": lambda: os.getenv("VLLM_LOOPBACK_IP", ""),

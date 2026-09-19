@@ -661,6 +661,33 @@ def bind_kv_cache_to_layers(
     share_replayssm_ring_trackers(ordered_layer_names, forward_context, kv_cache_groups)
 
 
+def zero_captured_kv_caches(
+    kv_caches: Iterable[torch.Tensor], *, full: bool = False
+) -> None:
+    """Restore the KV blocks a CUDA-graph capture dirtied, before serving.
+
+    Capture replays dummy batches whose block table is all zeros, so every write
+    that derives its slot from that table lands in physical block 0 while the
+    rest of the cache keeps whatever the capture activations left there. Block 0
+    is the reserved null block (``BlockPool.null_block``): the attention kernels
+    deliberately gather it for masked or padded entries and rely on the softmax
+    mask to discard the result, which only holds while the gathered data is
+    finite -- ``0 * NaN`` is still NaN, and the poisoned row then propagates into
+    every real token's attention output.
+
+    Zeroing block 0 is enough when capture only reaches it. ``full=True``
+    additionally zeroes whole caches, for capture paths whose dummy slot mappings
+    land on real pages.
+    """
+    for kv_cache in kv_caches:
+        if not kv_cache.numel() or not kv_cache.shape[0]:
+            continue
+        if full:
+            kv_cache.zero_()
+        else:
+            kv_cache[0].zero_()
+
+
 def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
     """Detach the KV/state cache tensors installed by bind_kv_cache().
 

@@ -728,8 +728,15 @@ def compute_global_topk_indices_and_lens(
     1. Block-table lookup (local index → global slot id)
     2. Valid-entry counting (topk_lens per token)
     3. Masking padding tokens to length 0
+
+    An index is only translated when it addresses a block this request's block
+    table can hold. The producers guarantee that valid entries are
+    non-negative, but a slot they never wrote keeps whatever the buffer held, so
+    translating such an entry would index the block table out of bounds and hand
+    the sparse-MLA kernels a slot outside the KV cache.
     """
     num_tokens = topk_indices.shape[0]
+    max_local_index = block_table.shape[1] * block_size
     global_topk_indices = torch.empty_like(topk_indices)
     topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
     _compute_global_topk_indices_and_lens_kernel[(num_tokens,)](
@@ -743,6 +750,7 @@ def compute_global_topk_indices_and_lens(
         block_table,
         block_table.stride(0),
         block_size,
+        max_local_index,
         is_valid_token,
         TRITON_BLOCK_SIZE=1024,
     )
@@ -761,6 +769,7 @@ def _compute_global_topk_indices_and_lens_kernel(
     block_table_ptr,
     block_table_stride: tl.constexpr,
     block_size: tl.constexpr,
+    max_local_index,
     is_valid_token_ptr,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
@@ -778,7 +787,7 @@ def _compute_global_topk_indices_and_lens_kernel(
             mask=mask,
             other=-1,
         )
-        is_valid = local_idx >= 0
+        is_valid = (local_idx >= 0) & (local_idx < max_local_index)
 
         block_indices = local_idx // block_size
         block_numbers = tl.load(
