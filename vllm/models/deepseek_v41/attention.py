@@ -494,6 +494,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             # the narrow one the attention input preparation stays in the captured
             # graph and MRV1 produces garbage (#51430).
             self._prepare_and_attn_fn = self._prepare_and_attn_eager
+        elif vllm_config.speculative_config is not None:
+            # Same failure mode on the V2 runner once the batch carries drafted
+            # tokens: the piecewise capture keeps the input preparation (query/KV
+            # projections, compressor, cache insertion) inside the graph and its
+            # launch parameters are baked from the capture-time dummy batch, which
+            # only matches a single-token decode. Replaying a verification batch
+            # (1 + num_speculative_tokens queries) then reads a mis-parameterised
+            # cache/indices buffer and the output becomes NaN. Widening the eager
+            # region covers the whole preparation, so it is re-executed per step
+            # with the live metadata.
+            self._prepare_and_attn_fn = self._prepare_and_attn_eager
 
         # Will be None on ROCm for now.
         self.aux_stream_list = aux_stream_list
