@@ -735,14 +735,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cudagraph_mode,
             decode_query_len=self.decode_query_len,
             lora_capture_cases=self.lora_capture_cases,
-            # Adaptive verification needs varlen descriptors because it trims
-            # per-request on device. VLLM_FORCE_VARLEN_DECODE_CAPTURE reaches the
-            # same capture path without it, so the composition-invariance of a
-            # decode graph can be tested on its own.
-            varlen_decode=(
-                self.adaptive_verification is not None
-                or envs.VLLM_FORCE_VARLEN_DECODE_CAPTURE
-            ),
+            varlen_decode=self.adaptive_verification is not None,
             ubatch_runner=self.ubatch_runner,
         )
         if self.cache_config.kv_sharing_fast_prefill and self.pcp_manager is None:
@@ -1081,9 +1074,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Capture wrote through an all-zero block table, so block 0 may hold
             # capture activations; the sparse-MLA kernels gather it for masked
             # entries and `0 * NaN` survives the mask. Restore it before serving.
-            zero_captured_kv_caches(
-                self.kv_caches, full=envs.VLLM_ZERO_ALL_KV_AFTER_CAPTURE
-            )
+            zero_captured_kv_caches(self.kv_caches)
             # Lock workspace to prevent resizing during execution. A resize after
             # capture frees the static cuda graph buffer.
             lock_workspace()

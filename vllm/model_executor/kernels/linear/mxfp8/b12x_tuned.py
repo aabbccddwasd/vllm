@@ -148,13 +148,9 @@ def _plan(n: int, k: int, m: int) -> tuple[int | None, int]:
     * **the plain grid must be narrow**, or split-K only adds the staging
       kernels (see ``_SPLIT_BY_N``).
     """
-    override = envs.VLLM_MXFP8_SPLIT_K
     if m > 32 or k % 128:
         return None, 1
-    if override > 0:
-        split = override if (k // 128) % override == 0 else 1
-    else:
-        split = _split_for(n, k)
+    split = _split_for(n, k)
     if split <= 1:
         return None, 1
     return (16 if m <= 16 else 32), split

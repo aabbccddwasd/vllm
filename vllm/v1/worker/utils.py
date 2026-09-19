@@ -670,9 +670,7 @@ def bind_kv_cache_to_layers(
     share_replayssm_ring_trackers(ordered_layer_names, forward_context, kv_cache_groups)
 
 
-def zero_captured_kv_caches(
-    kv_caches: Iterable[torch.Tensor], *, full: bool = False
-) -> None:
+def zero_captured_kv_caches(kv_caches: Iterable[torch.Tensor]) -> None:
     """Restore the KV blocks a CUDA-graph capture dirtied, before serving.
 
     Capture replays dummy batches whose block table is all zeros, so every write
@@ -683,18 +681,11 @@ def zero_captured_kv_caches(
     mask to discard the result, which only holds while the gathered data is
     finite -- ``0 * NaN`` is still NaN, and the poisoned row then propagates into
     every real token's attention output.
-
-    Zeroing block 0 is enough when capture only reaches it. ``full=True``
-    additionally zeroes whole caches, for capture paths whose dummy slot mappings
-    land on real pages.
     """
     for kv_cache in kv_caches:
         if not kv_cache.numel() or not kv_cache.shape[0]:
             continue
-        if full:
-            kv_cache.zero_()
-        else:
-            kv_cache[0].zero_()
+        kv_cache[0].zero_()
 
 
 def clear_layer_kv_caches(layers: Iterable[Any]) -> None:

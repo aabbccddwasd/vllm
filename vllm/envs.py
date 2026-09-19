@@ -259,7 +259,6 @@ if TYPE_CHECKING:
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB: int | None = None
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
-    VLLM_ZERO_ALL_KV_AFTER_CAPTURE: bool = False
     # Name the CUDA graph nodes a model component creates, so a trace of a graph
     # *replay* can still be split per component. Needs a driver with
     # cudaGraphNodeGetToolsId; inert (no-op) when unavailable.
@@ -292,9 +291,6 @@ if TYPE_CHECKING:
     # must be copied before the next is pulled.
     VLLM_INSTANTTENSOR_BACKEND: str = ""
     VLLM_INSTANTTENSOR_COPY: bool = True
-    # Capture decode graphs from varlen descriptors without adaptive
-    # verification, to test graph composition invariance on its own.
-    VLLM_FORCE_VARLEN_DECODE_CAPTURE: bool = False
     # Log batches whose per-request token counts differ, and the descriptor and
     # CUDA graph mode they land on.
     VLLM_RAGGED_DEBUG: bool = False
@@ -1899,12 +1895,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_CUDAGRAPH_GC": lambda: bool(
         int(os.getenv("VLLM_ENABLE_CUDAGRAPH_GC", "0"))
     ),
-    # Zero whole KV caches instead of only the reserved null block after CUDA
-    # graph capture. Capture whose dummy slot mappings reach real pages can leave
-    # non-finite rows there; the default (0) restores block 0 only.
-    "VLLM_ZERO_ALL_KV_AFTER_CAPTURE": lambda: bool(
-        int(os.getenv("VLLM_ZERO_ALL_KV_AFTER_CAPTURE", "0"))
-    ),
     # Profiling aids. All of them are inert unless explicitly enabled: the
     # annotation scopes and the shape log only record, never change a decision.
     "VLLM_GRAPH_KERNEL_ANNOTATIONS": lambda: bool(
@@ -1928,9 +1918,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_INSTANTTENSOR_BACKEND": lambda: os.getenv("VLLM_INSTANTTENSOR_BACKEND", ""),
     "VLLM_INSTANTTENSOR_COPY": lambda: bool(
         int(os.getenv("VLLM_INSTANTTENSOR_COPY", "1"))
-    ),
-    "VLLM_FORCE_VARLEN_DECODE_CAPTURE": lambda: bool(
-        int(os.getenv("VLLM_FORCE_VARLEN_DECODE_CAPTURE", "0"))
     ),
     "VLLM_RAGGED_DEBUG": lambda: bool(int(os.getenv("VLLM_RAGGED_DEBUG", "0"))),
     "VLLM_DSPARK_CONFIDENCE_HEAD": lambda: bool(
