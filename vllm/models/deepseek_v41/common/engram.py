@@ -642,6 +642,40 @@ def _engram_lookup_kernel(
         )
 
 
+class ExactPinnedHostTable:
+    """Host storage of exactly the requested size, registered for UVA reads.
+
+    ``torch.empty(pin_memory=True)`` rounds a request up to the next power of
+    two, so the ~23 GiB one Engram layer holds per rank reserves ~32 GiB. Across
+    two layers and four ranks that rounding alone is tens of GiB, and the pages
+    land in shared memory rather than in the process's own. Mapping anonymous
+    private pages and registering them allocates exactly the bytes asked for,
+    and a tensor built over the mapping still reports ``is_pinned()``, so the
+    accelerator view stays a no-copy alias of the registered memory.
+    """
+
+    def __init__(self, nbytes: int, label: str) -> None:
+        import ctypes
+        import mmap
+
+        self.nbytes = nbytes
+        self.label = label
+        self._mmap = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+        self._ptr = ctypes.addressof(ctypes.c_char.from_buffer(self._mmap))
+        cudart = torch.cuda.cudart()
+        err = cudart.cudaHostRegister(self._ptr, nbytes, 0)
+        if err != cudart.cudaError.success:
+            raise RuntimeError(
+                f"cudaHostRegister failed for the Engram host table ({label}): {err}"
+            )
+        self._raw = torch.frombuffer(self._mmap, dtype=torch.uint8)
+
+    def as_tensor(self, offset: int, rows: int, cols: int, dtype: torch.dtype):
+        """A ``[rows, cols]`` view of ``dtype`` at ``offset`` bytes into the table."""
+        nbytes = rows * cols * torch.empty(0, dtype=dtype).element_size()
+        return self._raw[offset : offset + nbytes].view(dtype).view(rows, cols)
+
+
 class ParallelEngramEmbedding(nn.Module):
     """TP-sharded hash heads with FP8 rows and per-block E8M0 scales."""
 

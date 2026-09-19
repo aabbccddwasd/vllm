@@ -26,6 +26,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v41.common.engram import (
     DEAD_ID,
     EngramLayout,
+    ExactPinnedHostTable,
     _engram_head_shard_weight_loader,
     _engram_select_rows,
 )
@@ -278,21 +279,23 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
             return storage.weight, storage.weight_scale_inv
         if not self.cpu_offload:
             return super()._allocate_weights()
-        # Model initialization may be inside a CUDA device context.
+        # The tables are large enough that torch's pinned allocator rounding a
+        # request up to the next power of two is the difference between fitting
+        # in host memory and not (a ~23 GiB layer reserves ~32 GiB), so map and
+        # register exactly the bytes the two tensors need.
+        self._host_table = ExactPinnedHostTable(
+            self.part_num_embeddings * (self.dim + self.dim // self.block_size),
+            f"{self.part_num_embeddings} rows x {self.dim}",
+        )
         return (
-            torch.empty(
-                self.part_num_embeddings,
-                self.dim,
-                dtype=torch.float8_e4m3fn,
-                device="cpu",
-                pin_memory=True,
+            self._host_table.as_tensor(
+                0, self.part_num_embeddings, self.dim, torch.float8_e4m3fn
             ),
-            torch.empty(
+            self._host_table.as_tensor(
+                self.part_num_embeddings * self.dim,
                 self.part_num_embeddings,
                 self.dim // self.block_size,
-                dtype=torch.uint8,
-                device="cpu",
-                pin_memory=True,
+                torch.uint8,
             ),
         )
 

@@ -95,11 +95,16 @@ def deepseek_v4_engram_warmup(
             for num_tokens in token_sizes:
                 if num_tokens > engram.staged_rows.shape[0]:
                     continue
-                # `prepare_embeddings` is the gather that runs inside the graph;
-                # hash ids are int32 [num_tokens, n_hash_cols] and the gathered
-                # rows land in `staged_rows`.
+                # `prepare_embeddings` is the gather that runs inside the graph.
+                # Hash ids are int32 [num_tokens, n_hash_cols] -- the *full* head
+                # width, as `DeepseekV4Attention` passes them: the lookup kernel
+                # indexes this tensor with the global head id
+                # (`HEAD_START + row % LOCAL_HEADS`), so each rank reads its own
+                # `part_n_hash_cols` columns out of the full-width rows. A
+                # narrower tensor makes every rank past the first read past its
+                # end.
                 hash_ids = torch.zeros(
-                    (num_tokens, embedding.part_n_hash_cols),
+                    (num_tokens, embedding.n_hash_cols),
                     dtype=torch.int32,
                     device=device,
                 )
