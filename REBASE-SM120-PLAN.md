@@ -4,19 +4,40 @@
 
 ---
 
-## 0.5 进度日志
+## 0.5 进度日志（已完成）
 
-分支 `sm120/rebase-main`（自 `origin/main` a1bf8ac12d）。
+分支 `sm120/rebase-main`（自 `origin/main` a1bf8ac12d），**19 个提交 / 57 文件 / +4706 −204**。
 备份：tag `backup/pre-rebase-20260919` → `dc753a76fb`；未提交工作冻结在 `wip/pre-rebase-snapshot`（`fc1c473b7d`）。
 
-| 状态 | 提交 | 内容 | 验收 |
-|---|---|---|---|
-| ✅ | `406b7f7a25` | **S1** family 12 页几何 + backend 声明 + `max(1, ratio)` 守卫 | `test_deepseek_v41_block_size.py` 20 passed |
-| ✅ | `02bbab31d4` | **S2** 捕获后 KV 安全（block 0 默认 / `VLLM_ZERO_ALL_KV_AFTER_CAPTURE` 全清）+ KVBlockZeroer teardown + top-k 上界 | CPU 3 passed；GPU 2 passed，**去掉上界即失败**（已反证） |
-| ✅ | `42ba508d0c` | **S3a** decode/prefill 边界统一到 verify 宽度（上游无 issue 无 PR） | `test_attention_splitting.py` 30 passed（+7） |
-| ✅ | `f5e2aafc21` | **S3c** V2 + 投机时走 wide eager region | 回归 109 passed |
-| ✅ | `b60dbb7274` | **S6** loader 跳过 checkpoint 中无对应参数的张量 | ruff + import 冒烟 |
-| ⏳ | — | **S3b** `#52499` overlay / **S4** cudagraph multistream / **S5** engram / **S7** instrumentation / **S8** mxfp8·o_proj | 见 §6 |
+| 阶段 | 提交 | 内容 |
+|---|---|---|
+| **S1** | `406b7f7a25` | family 12 页几何（`64 × ratio` 使 `num_states` 恒 64）+ backend 声明 + `max(1, ratio)` 守卫 |
+| **S2** | `02bbab31d4` | 捕获后 KV 安全（默认清 block 0，`VLLM_ZERO_ALL_KV_AFTER_CAPTURE` 全清）+ `KVBlockZeroer` teardown + top-k 越界上界 |
+| **S3a** | `42ba508d0c` | decode/prefill 边界统一到 verify 宽度（上游无 issue 无 PR） |
+| **S3c** | `f5e2aafc21` | V2 runner + 投机时走 wide eager region |
+| **S3b** | `a9d9765ffc` | `#52499` overlay：SM12x sparse-MLA spec-decode 形状（4-D query / ≤64 段 / 空 chunk） |
+| **S4a** | `aaa336ea85` | 调用方可提供 global top-k 缓冲（图内不再分配） |
+| **S4b** | `bac7b9d1a8` | MXFP8 空 batch（`#57028` 的非几何部分） |
+| **S4c** | `a842e7ce0e` | 多流 CUDA event 句柄按图隔离（保留图内重叠） |
+| **S5a** | `d917c92c31` | Engram host 表按精确尺寸映射并注册（替代 `pin_memory` 幂次取整）+ warmup id 宽度 |
+| **S5b** | `314ff839e9` | 预热 Engram row gather |
+| **S6** | `b60dbb7274` | loader 跳过 checkpoint 中无对应参数的张量 |
+| **S7** | `f51cc1c8b2` | GEMM 形状 / 集合通信 / 图节点标注埋点（全默认关） |
+| **S8a** | `9eb1077ff1` | family 12 的 MXFP8 调优后端 + per-shape 策略（默认走上游） |
+| **S8b** | `2735ce0e2c` | wo_a 分组投影小批快路径（SM120 实测数据在提交信息里） |
+| **S8c** | `17e673ab4b` | mHC prenorm split 阶梯 + 可选融合 eager RMSNorm |
+| **S8d** | `75a16e2849` | 只对 grouped 布局真正读取的行做 act-quant |
+| **S10** | `24ec782996` | 大于主机内存的 checkpoint 加载（分片 + page-cache 驱逐 + cuFile 后端） |
+| **S9/S11** | `156d89ff7f` | verify 宽度成本模型求解（默认关）+ 置信度头解耦 + 异步调度胶水 |
+
+**被 DROP 的本地提交（有证据）**：
+- `9b18c761fd`（engram 常量 grid）→ 上游已把 `GRID` 放进 `do_not_specialize`，不再按 token 数重编译，且不浪费 program；
+- `5912d3cbce` 的 vision 加宽部分 → 已被合并的 **#57152**（`mm_prefix_clamp_sliding_window`，V4.1 恒不加宽）取代；
+- `8e40aab9c9`（投机批按 FULL 捕获）→ 相对 main 净效果为零（继承值本就是 `UNIFORM_BATCH`）；
+- `0fd525aeb7` / `6d74b9a0f2` / `09c74046c5` → 依赖未验证能力或本身是"默认关的取证工具"（见 §5.4/§5.5）；
+- `#57388` / `#55692` → 他人仍在 review 的 open PR，不 vendor。
+
+**未纳入（与你原方案一致）**：H1 breakable-serves-FULL 三连（自测仍 degenerate）——留在 `wip/pre-rebase-snapshot`。
 
 全量验收（GPU 默认模式）：
 ```
@@ -292,11 +313,43 @@ serve 冒烟（eager + 图）、1M 上下文 needle、DSpark k=5 tok/s 与 accep
 
 ---
 
-## 10. 执行清单（待你确认后开始）
+## 10. 执行清单（已完成）
 
-1. [ ] 确认 §3 的 4 个 DROP 与 2 个 HOLD
-2. [ ] 确认 §5.2 的 all-pages 默认值策略（建议：默认 block-0 + opt-in 全清）
-3. [ ] 确认 §4 G3 的性能开关是否全部回退为 opt-in（建议：是）
-4. [ ] 确认是否保留 S7 instrumentation 进主线（建议：保留、独立提交、默认关）
-5. [ ] 建分支 `sm120/rebase-main`，按 S1→S8 顺序落地，每个 Sx 附 Tier 0/1 结果
-6. [ ] 全程不改动旧分支；GPU 空闲后再做 Tier 2 与 H1
+- [x] §3 的 DROP 与 HOLD 全部执行（证据见 §0.5 末尾）
+- [x] all-pages 默认值：`VLLM_ZERO_ALL_KV_AFTER_CAPTURE` 默认 0（block-0），全清 opt-in
+- [x] G3 性能开关：**改变数值/几何的**一律 opt-in（`VLLM_IR_RMS_NORM_EAGER_FUSED`、`VLLM_MHC_PRE_MAX_SPLITS` 回上游值）；**同数学、只换 kernel 的**保持默认开（o_proj 两条、`VLLM_ACT_QUANT_INDEXED`），理由写在各提交信息里
+- [x] S7 instrumentation 进主线，独立提交，默认关
+- [x] `sm120/rebase-main` 建成，S1→S9/S11 顺序落地，每步附 Tier 0/1 结果
+- [x] 旧分支与备份未动；GPU 空闲期间完成了 GPU 侧验收（Tier 2 的真实模型 e2e 仍缺 checkpoint）
+
+## 11. 验收记录
+
+**Tier 0（全部改动文件）**
+```
+python3 -m py_compile <57 个改动文件>            -> OK
+ruff check <57 个改动文件>                       -> All checks passed
+ruff format --check <57 个改动文件>              -> 57 files already formatted
+python3 tools/sm120_scope_check.py origin/main   -> passed
+```
+`tools/sm120_scope_check.py`（本次新增）断言：增量代码不出现 `family(100)` / `sm_100` / tcgen05 /
+`deep_gemm_mega_moe` / `deep_select` / `gvr_2`；四道守卫（top-k 上界、缺失参数跳过、捕获后 KV 恢复、family-12
+页几何）都在；17 个新开关默认值为保守值。
+
+**Tier 1（GPU 空闲，默认模式）**
+```
+pytest -q tests/v1/attention/test_deepseek_v41_block_size.py \
+          tests/v1/attention/test_attention_splitting.py \
+          tests/v1/attention/test_deepseek_v4_swa_visible.py \
+          tests/v1/spec_decode/test_verify_width.py \
+          tests/v1/worker/test_utils.py \
+          tests/test_multi_stream_utils.py \
+          tests/models/deepseek_v4_1/ \
+          tests/model_executor/test_deepseek_v4_engram_warmup.py \
+          tests/kernels/quantization/test_mxfp8_empty_batch.py
+```
+其中 `test_deepseek_v4_swa_visible.py::test_builder_in_image_visibility` 因**本机无 HF 网络**
+（`Network is unreachable`，失败点在 `tests/v1/attention/utils.py` 构造 `ModelConfig`）失败，与本次改动无关。
+
+**Tier 2（未做）**：真实 `DeepSeek-V4.1-Flash` e2e（557 GB checkpoint 不在本机）、
+`VLLM_ZERO_ALL_KV_AFTER_CAPTURE` 对照、tok/s 与 acceptance 测量。
+
