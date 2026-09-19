@@ -292,6 +292,17 @@ if TYPE_CHECKING:
     # Run the IR rms_norm op instead of its torch reference outside compiled
     # regions. Changes which kernel produces the norm, so it stays opt-in.
     VLLM_IR_RMS_NORM_EAGER_FUSED: bool = False
+    # Drop a shard from the page cache once its weights have been consumed. Only
+    # meaningful for checkpoints that do not fit in host memory alongside the
+    # process; off by default.
+    VLLM_SAFETENSORS_DROP_CACHE: bool = False
+    # Largest single tensor an InstantTensor (device-side) load may stage; files
+    # holding anything larger are read shard-by-shard by the safetensors path.
+    VLLM_DEVICE_LOADER_MAX_TENSOR_BYTES: int = 2 << 30
+    # InstantTensor backend name ("" = library default) and whether each tensor
+    # must be copied before the next is pulled.
+    VLLM_INSTANTTENSOR_BACKEND: str = ""
+    VLLM_INSTANTTENSOR_COPY: bool = True
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
@@ -1900,6 +1911,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MHC_PRE_MAX_SPLITS": lambda: int(os.getenv("VLLM_MHC_PRE_MAX_SPLITS", "16")),
     "VLLM_IR_RMS_NORM_EAGER_FUSED": lambda: bool(
         int(os.getenv("VLLM_IR_RMS_NORM_EAGER_FUSED", "0"))
+    ),
+    "VLLM_SAFETENSORS_DROP_CACHE": lambda: bool(
+        int(os.getenv("VLLM_SAFETENSORS_DROP_CACHE", "0"))
+    ),
+    "VLLM_DEVICE_LOADER_MAX_TENSOR_BYTES": lambda: int(
+        os.getenv("VLLM_DEVICE_LOADER_MAX_TENSOR_BYTES", str(2 << 30))
+    ),
+    "VLLM_INSTANTTENSOR_BACKEND": lambda: os.getenv("VLLM_INSTANTTENSOR_BACKEND", ""),
+    "VLLM_INSTANTTENSOR_COPY": lambda: bool(
+        int(os.getenv("VLLM_INSTANTTENSOR_COPY", "1"))
     ),
     # Used to force set up loopback IP
     "VLLM_LOOPBACK_IP": lambda: os.getenv("VLLM_LOOPBACK_IP", ""),
