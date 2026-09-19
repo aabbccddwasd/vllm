@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
 from dataclasses import replace
 from typing import Any
 
@@ -257,6 +258,9 @@ class DeepseekV41ModelState(DefaultModelState):
         # must not be reused while its GPU readers are in flight.
         self._dropped_staging = UvaBufferPool(self.max_num_reqs + 1, torch.int32)
         self._replay_kv_start_staging = UvaBufferPool(self.max_num_reqs, torch.int32)
+        # The config the replay metadata builders are built against; narrowed on
+        # first use (see _replay_vllm_config).
+        self._replay_config: VllmConfig | None = None
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -570,12 +574,25 @@ class DeepseekV41ModelState(DefaultModelState):
         self, attn_groups: list[list[AttentionGroup]]
     ) -> list[list[AttentionGroup]]:
         """The step's attention groups with metadata builders of their own: the
-        runner's hold the batch's metadata past the forward."""
+        runner's hold the batch's metadata past the forward.
+
+        Those builders size several workspaces from the config's *batch* budget
+        instead of from the batch itself. A replay forward never exceeds
+        ``max_num_reqs * window`` tokens (``_prepare_replay_batch`` keeps at
+        most one window per request), while ``max_num_batched_tokens`` is the
+        whole prefill batch's budget: at 1M context the indexer's expanded
+        block table alone is that many rows of the full block-table width --
+        hundreds of MiB the replay can never touch, and enough to push the 1M
+        recipe past its KV-cache budget. So the replay builders are built
+        against a config with that one budget narrowed. Context-dependent sizes
+        (``max_model_len``, hence the block-table width) stay untouched: the
+        replay layers still attend over each request's whole context.
+        """
 
         def builder(group: AttentionGroup) -> AttentionMetadataBuilder:
             if id(group) not in self._replay_builders:
                 self._replay_builders[id(group)] = group.make_metadata_builder(
-                    self.vllm_config,
+                    self._replay_vllm_config(),
                     self.device,
                     group.metadata_builders[0].kernel_block_size,
                 )
@@ -585,3 +602,33 @@ class DeepseekV41ModelState(DefaultModelState):
             [replace(group, metadata_builders=[builder(group)]) for group in groups]
             for groups in attn_groups
         ]
+
+    def _replay_vllm_config(self) -> VllmConfig:
+        """The config the replay metadata builders are built against.
+
+        Identical to the engine's except for the batch budget, which is the
+        replay batch's own bound. Everything context-sized is left alone, so
+        the narrowing can only shrink workspaces that the replay batch cannot
+        fill.
+        """
+        if self._replay_config is None:
+            assert self.decoder_replay is not None
+            cfg = self.vllm_config
+            budget = self.max_num_reqs * int(self.decoder_replay.window)
+            batch_budget = cfg.scheduler_config.max_num_batched_tokens
+            if budget < batch_budget:
+                scheduler_config = copy.copy(cfg.scheduler_config)
+                scheduler_config.max_num_batched_tokens = budget
+                narrowed = copy.copy(cfg)
+                narrowed.scheduler_config = scheduler_config
+                self._replay_config = narrowed
+                logger.info_once(
+                    "Decoder SWA bounded replay: replay metadata builders are "
+                    "sized for %d tokens (the replay batch's bound) instead of "
+                    "the engine's %d.",
+                    budget,
+                    batch_budget,
+                )
+            else:
+                self._replay_config = cfg
+        return self._replay_config
