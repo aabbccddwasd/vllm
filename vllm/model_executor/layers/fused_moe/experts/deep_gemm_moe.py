@@ -456,6 +456,18 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
 
         self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
 
+    def _activation_out_dim(self, N: int, activation: MoEActivation) -> int:
+        """Width of the FP8 activation that FC2 reduces over.
+
+        w13's N may be stored compact (the exact per-rank gate/up size) while
+        FC2's reduction dim has to keep the 128-rounded intermediate size that
+        the mixed FP8xFP4 GEMM requires, hence the maximum of the two.
+        """
+        return max(
+            self.adjust_N_for_activation(N, activation),
+            self.moe_config.intermediate_size_per_partition,
+        )
+
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
@@ -521,7 +533,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         )
         assert M_sum % align_used == 0
 
-        activation_out_dim = self.adjust_N_for_activation(N, activation)
+        activation_out_dim = self._activation_out_dim(N, activation)
         # workspace1 holds the permuted and requantized FP8 activations. The
         # workspace manager allocates it in the model activation dtype, so
         # account for the dtype sizes rather than overallocating BF16/FP16.
@@ -545,7 +557,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         scale_fmt = DeepGemmQuantScaleFMT.from_oracle()
 
         M_sum, N = input.size()
-        activation_out_dim = self.adjust_N_for_activation(N, activation)
+        activation_out_dim = self._activation_out_dim(N, activation)
 
         if activation == MoEActivation.SILU:
             # Fused gate+mul+quant kernels for the common SILU case.
@@ -665,7 +677,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                 )
 
             # SwiGLU activation + FP8 requant
-            activation_out_dim = self.adjust_N_for_activation(N, activation)
+            activation_out_dim = self._activation_out_dim(N, activation)
             quant_out = _resize_cache(
                 workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, activation_out_dim)
             )
@@ -688,7 +700,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                     "deepgemm.fp8_fp4_moe_gemm2",
                     M=M_sum,
                     N=K,
-                    K=self.adjust_N_for_activation(N, activation),
+                    K=a2q.size(1),
                     local_experts=local_num_experts,
                 )
                 m_grouped_fp8_fp4_gemm_nt_contiguous(

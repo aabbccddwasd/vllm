@@ -102,6 +102,11 @@ def _per_token_group_quant_fp8(
     quantization on a tensor.
     This function converts the tensor values into float8 values.
     """
+    assert y_num_columns % group_size == 0, (
+        f"this quantizer needs a group-aligned width, got {y_num_columns} with "
+        f"group_size {group_size}; the packed UE8M0 path handles a partial tail, "
+        "this one does not (see VLLM_MXFP4_MOE_COMPACT_W13)"
+    )
     groups_per_row = y_num_columns // group_size
 
     # Map the program id to the row of X and Y it should compute.
@@ -151,6 +156,7 @@ def _silu_mul_quant_fp8_packed_kernel(
     alpha,
     beta,
     N: tl.constexpr,
+    OUT_WIDTH: tl.constexpr,
     GROUPS_PER_ROW: tl.constexpr,
     PACKS_PER_ROW: tl.constexpr,
     fp8_min: tl.constexpr,
@@ -175,7 +181,21 @@ def _silu_mul_quant_fp8_packed_kernel(
     row_offsets = tl.arange(0, BLOCK_M)
     pack_offsets = tl.arange(0, PACKS_PER_CTA)
 
-    col_mask = (col_start + col_offsets) < (GROUPS_PER_ROW * GROUP_SIZE)
+    # The group extent (which the scale store must cover) and the real width
+    # (which the activation loads and the quantized store must respect) differ
+    # when ``hidden_size`` is not a multiple of ``GROUP_SIZE``: the last group
+    # then holds a partial tail and only its real elements may be touched. The
+    # two masks are equal whenever the width is aligned -- which is what the
+    # padded geometry (576 -> 640) provides -- so the padded path is unchanged.
+    #
+    # ``OUT_WIDTH`` may exceed ``hidden_size`` when the consumer of this FP8
+    # tensor requires a wider reduction dim than the activation's real width
+    # (DeepGEMM's mixed FP8xFP4 GEMM needs K % 128 == 0 while a compact w13
+    # activation is 576 wide). The guarded loads then read 0.0, so the tail
+    # groups quantize to exact zeros -- which contribute nothing to the GEMM
+    # against the zero weight rows they are paired with.
+    real_mask = (col_start + col_offsets) < hidden_size
+    out_mask = (col_start + col_offsets) < OUT_WIDTH
 
     # persistent with grid_m-stride loop
     while row_start < M:
@@ -190,7 +210,7 @@ def _silu_mul_quant_fp8_packed_kernel(
 
         gate_flat = tl.load(
             input_ptr + input_row_start + col_start + col_offsets[None, :],
-            mask=row_mask[:, None] & col_mask[None, :],
+            mask=row_mask[:, None] & real_mask[None, :],
             other=0.0,
         )
         up_flat = tl.load(
@@ -199,7 +219,7 @@ def _silu_mul_quant_fp8_packed_kernel(
             + hidden_size
             + col_start
             + col_offsets[None, :],
-            mask=row_mask[:, None] & col_mask[None, :],
+            mask=row_mask[:, None] & real_mask[None, :],
             other=0.0,
         )
 
@@ -230,7 +250,7 @@ def _silu_mul_quant_fp8_packed_kernel(
         tl.store(
             output_q_ptr + output_row_start + col_start + col_offsets[None, :],
             y_q_flat.to(output_q_ptr.dtype.element_ty),
-            mask=row_mask[:, None] & col_mask[None, :],
+            mask=row_mask[:, None] & out_mask[None, :],
         )
 
         scale_byte = tl.clamp(exponent + 127.0, 0.0, 255.0).to(tl.int32)
@@ -283,18 +303,27 @@ def silu_mul_quant_fp8_packed_triton(
         M_work = row_idx.numel()
     hidden_size = N // 2
 
-    assert hidden_size % group_size == 0
-
     fp8_dtype = torch.float8_e4m3fn
     finfo = torch.finfo(fp8_dtype)
     fp8_min, fp8_max = finfo.min, finfo.max
 
-    groups_per_row = hidden_size // group_size
-    groups_per_pack = 4  # pack 4 UE8M0 scales to a single INT32
-    packs_per_row = triton.cdiv(groups_per_row, groups_per_pack)
-
     if output_q is None:
         output_q = torch.empty((M, hidden_size), dtype=fp8_dtype, device=input.device)
+    out_width = output_q.size(1)
+    # ``hidden_size`` need not be a multiple of ``group_size``: the last group
+    # may hold a partial tail, which the kernel masks on its real width.
+    # ``out_width`` may be wider still (a padded reduction dim for DeepGEMM);
+    # the extra columns are written as exact zeros.
+    assert out_width >= hidden_size, (out_width, hidden_size)
+    if out_width > hidden_size:
+        assert out_width % group_size == 0, (
+            f"a widened output (padded reduction dim) must be group-aligned, got "
+            f"{out_width} with group_size {group_size}"
+        )
+
+    groups_per_row = triton.cdiv(out_width, group_size)
+    groups_per_pack = 4  # pack 4 UE8M0 scales to a single INT32
+    packs_per_row = triton.cdiv(groups_per_row, groups_per_pack)
 
     aligned_m = triton.cdiv(M, 4) * 4
     output_scale_packed = torch.empty(
@@ -335,6 +364,7 @@ def silu_mul_quant_fp8_packed_triton(
         alpha,
         beta,
         N=N,
+        OUT_WIDTH=out_width,
         GROUPS_PER_ROW=groups_per_row,
         PACKS_PER_ROW=packs_per_row,
         fp8_min=fp8_min,
@@ -537,6 +567,11 @@ def _per_token_group_quant_fp8_colmajor(
     quantization on a tensor.
     This function converts the tensor values into float8 values.
     """
+    assert y_num_columns % group_size == 0, (
+        f"this quantizer needs a group-aligned width, got {y_num_columns} with "
+        f"group_size {group_size}; the packed UE8M0 path handles a partial tail, "
+        "this one does not (see VLLM_MXFP4_MOE_COMPACT_W13)"
+    )
     groups_per_row = y_num_columns // group_size
 
     # Map the program id to the row of X and Y it should compute.
@@ -746,6 +781,11 @@ def per_token_group_quant_fp8_packed_for_deepgemm(
     # compute DeepGEMM-style packed scale tensor shape.
     hidden_dim = x.shape[-1]
     mn = x.numel() // hidden_dim
+    assert hidden_dim % group_size == 0, (
+        f"this quantizer needs a group-aligned width, got {hidden_dim} with "
+        f"group_size {group_size}; the packed UE8M0 path handles a partial tail, "
+        "this one does not (see VLLM_MXFP4_MOE_COMPACT_W13)"
+    )
     num_groups_per_row = hidden_dim // group_size
     k_num_packed_sf_k = (num_groups_per_row + 3) // 4
     tma_aligned_mn = ((mn + 3) // 4) * 4

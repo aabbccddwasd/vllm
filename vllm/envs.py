@@ -278,6 +278,11 @@ if TYPE_CHECKING:
     # torch allocation and non-torch memory -- to attribute what the KV cache
     # budget is actually spent on.
     VLLM_MEM_LOG: bool = False
+    # Store w13 (gate/up) at the model's exact, unrounded N for the DeepGEMM
+    # MXFP4 backend. Rounding costs 1152 -> 1280 rows on a TP4 DeepSeek-V4.1
+    # rank, i.e. ~11% of the w13 weights resident as zero rows. w2's reduction
+    # dim stays 128-rounded since the mixed FP8xFP4 GEMM requires K % 128 == 0.
+    VLLM_MXFP4_MOE_COMPACT_W13: bool = False
     # MXFP8 kernel policy. "" keeps upstream selection; "auto" picks the fastest
     # bit-exact backend per shape; "b12x_tuned" forces the tuned family-12 kernel.
     VLLM_MXFP8_BACKEND_POLICY: str = ""
@@ -1936,6 +1941,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_COMM_SHAPE_LOG": lambda: bool(int(os.getenv("VLLM_COMM_SHAPE_LOG", "0"))),
     "VLLM_MOE_PAD_LOG": lambda: bool(int(os.getenv("VLLM_MOE_PAD_LOG", "0"))),
     "VLLM_MEM_LOG": lambda: bool(int(os.getenv("VLLM_MEM_LOG", "0"))),
+    "VLLM_MXFP4_MOE_COMPACT_W13": lambda: bool(
+        int(os.getenv("VLLM_MXFP4_MOE_COMPACT_W13", "0"))
+    ),
     "VLLM_MXFP8_BACKEND_POLICY": lambda: os.getenv("VLLM_MXFP8_BACKEND_POLICY", ""),
     "VLLM_MXFP8_SPLIT_K": lambda: int(os.getenv("VLLM_MXFP8_SPLIT_K", "0")),
     "VLLM_O_PROJ_GROUPED_MM": lambda: bool(

@@ -746,7 +746,11 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
         intermediate_size = round_up(intermediate_size, OCP_MX_BLOCK_SIZE)
         hidden_size = round_up(hidden_size, OCP_MX_BLOCK_SIZE)
     elif backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
-        # DeepGEMM requires M/N/K alignment
+        # DeepGEMM's mixed FP8xFP4 GEMM requires K % 128 == 0 (asserted in its
+        # host API), and w2's reduction dim is this intermediate size, so it has
+        # to stay rounded: 576 -> 640 materializes 64 zero K rows per rank and
+        # expert. w13's N carries no such constraint, so its own rounding is
+        # dropped behind VLLM_MXFP4_MOE_COMPACT_W13 (see Mxfp4MoEMethod).
         intermediate_size = round_up(intermediate_size, 128)
         hidden_size = round_up(hidden_size, 128)
     elif backend in (Mxfp4MoeBackend.MARLIN, Mxfp4MoeBackend.BATCHED_MARLIN):
