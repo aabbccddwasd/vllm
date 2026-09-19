@@ -76,6 +76,16 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     RoutedExpertsTensors,
 )
+from vllm.v1.spec_decode.verify_width import (
+    COST_FORGETTING,
+    COST_INTERVAL_STEPS,
+    COST_MIN_ROW_SPREAD,
+    COST_MIN_SAMPLES,
+    COST_WINDOW_STEPS,
+    RowCostModel,
+    solve_verify_widths,
+)
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.watermarking.spec_decode import (
@@ -299,6 +309,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_prefill_lookahead = max(1, vllm_config.num_prefill_lookahead_tokens)
 
         self.step_timing = StepTimingCollector()
+        # Online cost curve: the marginal price of a verify row is a property of
+        # the load, not of the hardware, so the engine measures its own steps.
+        # The single decision hyperparameter anchors the fit; the intercept, the
+        # per-request cost and the ragged penalty are learned from the engine's
+        # own steps, so no threshold or width table is configured anywhere.
+        self.row_cost_model = RowCostModel(
+            t0=0.0,
+            c_row=envs.VLLM_DSPARK_VERIFY_COST_MS,
+            forgetting=COST_FORGETTING,
+            min_samples=COST_MIN_SAMPLES,
+            min_row_spread=COST_MIN_ROW_SPREAD,
+        )
+        self._cost_window_left = 0
+        self._cost_countdown = 0
 
         # General request states.
         self.req_states = RequestState(
@@ -711,7 +735,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cudagraph_mode,
             decode_query_len=self.decode_query_len,
             lora_capture_cases=self.lora_capture_cases,
-            varlen_decode=self.adaptive_verification is not None,
+            # Adaptive verification needs varlen descriptors because it trims
+            # per-request on device. VLLM_FORCE_VARLEN_DECODE_CAPTURE reaches the
+            # same capture path without it, so the composition-invariance of a
+            # decode graph can be tested on its own.
+            varlen_decode=(
+                self.adaptive_verification is not None
+                or envs.VLLM_FORCE_VARLEN_DECODE_CAPTURE
+            ),
             ubatch_runner=self.ubatch_runner,
         )
         if self.cache_config.kv_sharing_fast_prefill and self.pcp_manager is None:
@@ -1645,14 +1676,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        # One zero-length range per engine step. A torch/nsys trace can then be
+        # cut into steps without guessing, and the ranges below name the phases.
+        # Null context unless VLLM_CUSTOM_SCOPES_FOR_PROFILING=1.
+        with record_function_or_nullcontext("v2: step"):
+            pass
         if not dummy_run:
-            # Update the request states.
-            self.update_pp_decode_requests()
-            self.finish_requests(scheduler_output)
-            self.free_states(scheduler_output)
-            self.add_requests(scheduler_output)
-            self.update_requests(scheduler_output)
-            self.block_tables.apply_staged_writes()
+            with record_function_or_nullcontext("v2: state_update"):
+                # Update the request states.
+                self.update_pp_decode_requests()
+                self.finish_requests(scheduler_output)
+                self.free_states(scheduler_output)
+                self.add_requests(scheduler_output)
+                self.update_requests(scheduler_output)
+                self.block_tables.apply_staged_writes()
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
@@ -1706,6 +1743,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             uniform_decode=uniform_tok_count == self.decode_query_len,
         )
 
+        if envs.VLLM_RAGGED_DEBUG and not dummy_run:
+            counts_np = np.fromiter(
+                scheduler_output.num_scheduled_tokens.values(),
+                dtype=np.int32,
+                count=num_reqs,
+            )
+            if counts_np.size and int(counts_np.min()) != int(counts_np.max()):
+                logger.info(
+                    "RAGGED_BATCH mode=%s num_reqs=%d live_tokens=%d "
+                    "uniform_tok_count=%s max_query_len=%d desc=(tokens=%d reqs=%s "
+                    "max_q=%s) counts=%s",
+                    batch_desc.cg_mode,
+                    num_reqs,
+                    num_toks,
+                    uniform_tok_count,
+                    max_query_len,
+                    batch_desc.num_tokens,
+                    batch_desc.num_reqs,
+                    batch_desc.max_query_len,
+                    counts_np[:16].tolist(),
+                )
+
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
@@ -1718,10 +1777,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.observability_config.cudagraph_metrics:
                 cudagraph_stats = make_cudagraph_stats(batch_desc, num_toks)
             assert batch_req_state is not None
-            input_batch = self.prepare_inputs(
-                scheduler_output, batch_req_state, batch_desc, num_active_loras
-            )
-            block_tables, slot_mappings = self.prepare_attn(input_batch)
+            with record_function_or_nullcontext("v2: prepare_inputs"):
+                input_batch = self.prepare_inputs(
+                    scheduler_output, batch_req_state, batch_desc, num_active_loras
+                )
+            with record_function_or_nullcontext("v2: prepare_attn"):
+                block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
@@ -1895,10 +1956,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.model_config, input_batch.num_tokens, ubatch_slices
         )
 
-        self.step_timing.record_batch(
-            input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
-        )
+        is_full_graph = batch_desc.cg_mode == CUDAGraphMode.FULL
+        self.step_timing.record_batch(input_batch, is_full_graph)
         self.step_timing.forward_start()
+        if not dummy_run and not input_batch.has_prefill:
+            self._sample_row_cost(input_batch, is_full_graph)
 
         connector_kwargs = dict(
             scheduler_output=scheduler_output,
@@ -1913,10 +1975,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
-            self.kv_connector.pre_forward(
-                **connector_kwargs, attn_metadata=attn_metadata
-            )
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            with record_function_or_nullcontext("v2: forward"):
+                self.kv_connector.pre_forward(
+                    **connector_kwargs, attn_metadata=attn_metadata
+                )
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -2055,9 +2118,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 for states in aux_hidden_states
             ]
 
-        sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
-        )
+        with record_function_or_nullcontext("v2: sample"):
+            sampler_output, num_sampled, num_rejected = self.sample(
+                hidden_states, input_batch, grammar_output
+            )
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -2170,6 +2234,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
+            if envs.VLLM_DSPARK_CONFIDENCE_WIDTH:
+                recommended = self._recommend_spec_tokens(input_batch)
+                if recommended is not None:
+                    model_runner_output.recommended_spec_tokens = recommended
+            if envs.VLLM_DSPARK_CONFIDENCE_WIDTH_PER_REQ:
+                per_req = self._recommend_spec_tokens_per_req(input_batch)
+                if per_req is not None:
+                    model_runner_output.recommended_spec_tokens_per_req = per_req
+                    model_runner_output.recommended_spec_tokens = max(per_req)
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
@@ -2192,6 +2265,257 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.draft_tokens_handler.get_draft_tokens()
+
+    def _width_pattern(self) -> list[int] | None:
+        """Parsed ``VLLM_DSPARK_WIDTH_PATTERN``, cycled over the batch.
+
+        A ``step:`` prefix cycles the list over *steps* instead, handing the
+        whole batch one width at a time — that is the measurement mode for
+        scanning step time against verified rows without crossing requests.
+        """
+        raw = envs.VLLM_DSPARK_WIDTH_PATTERN
+        if not raw:
+            return None
+        try:
+            values = [int(x) for x in raw.replace(" ", "").split(",") if x != ""]
+        except ValueError:
+            logger.warning("VLLM_DSPARK_WIDTH_PATTERN %r is not a list of ints", raw)
+            return None
+        if not values:
+            return None
+        return [max(0, min(v, self.num_speculative_steps)) for v in values]
+
+    def _sample_row_cost(self, input_batch: InputBatch, full_graph: bool) -> None:
+        """Feed the online row-cost model from real serving steps.
+
+        Only decode-only steps in the full graph are sampled: a step sharing its
+        batch with a prefill chunk prices a different machine, and so does an
+        eager step. Windows are short and rare, and each costs one device
+        synchronization at its end, on events that have long completed.
+        """
+        model = self.row_cost_model
+        if model is None:
+            return
+        if not (
+            envs.VLLM_DSPARK_CONFIDENCE_WIDTH
+            or envs.VLLM_DSPARK_CONFIDENCE_WIDTH_PER_REQ
+        ):
+            # Nothing consumes the estimate, so do not pay for it: a run without
+            # a width policy must keep its baseline untouched.
+            return
+        if self._cost_window_left <= 0:
+            if self._cost_countdown > 0:
+                self._cost_countdown -= 1
+                return
+            # One extra step, so the window yields COST_WINDOW_STEPS intervals.
+            self._cost_window_left = COST_WINDOW_STEPS + 1
+            self.step_timing.open_cost_window()
+        joined = self.step_timing.record_cost_step(input_batch, full_graph)
+        if joined:
+            self._cost_window_left -= 1
+        if self._cost_window_left <= 0 or not joined:
+            for sample in self.step_timing.close_cost_window():
+                model.observe(
+                    sample.rows, sample.num_reqs, sample.step_ms, sample.ragged
+                )
+            self._cost_window_left = 0
+            self._cost_countdown = COST_INTERVAL_STEPS
+
+    def _cost_fit_state(self) -> str:
+        """Compact fit state for the width probe."""
+        if self.row_cost_model is None:
+            return "off"
+        state = self.row_cost_model.state()
+        return (
+            f"n={int(state['n'])} rows={int(state['row_min'])}-{int(state['row_max'])}"
+            f" reqs={int(state['req_min'])}-{int(state['req_max'])}"
+            f" t0={state['t0']:.2f} c_row={state['c_row']:.3f}"
+            f" c_req={state['c_req']:.3f} c_ragged={state['c_ragged']:.3f}"
+            f" ragged_n={int(state['ragged'])}"
+        )
+
+    def _row_cost(self) -> tuple[float, float, float, float] | None:
+        """``(t0, c_row, c_req, c_ragged)`` to price verify rows with, or None.
+
+        The row price is the deployment's one hyperparameter until the engine has
+        seen two different batch sizes and can measure it (the cost curve is
+        concave, so the price is a property of the load, not of the hardware).
+        The batch's fixed costs are measurable from a single size, so the
+        decision starts as soon as those exist. None — before even that — means
+        the width is left alone.
+        """
+        model = self.row_cost_model
+        measured = model.estimate()
+        if measured is not None:
+            return measured
+        fixed = model.intercept()
+        if fixed is None:
+            return None
+        return fixed[0], envs.VLLM_DSPARK_VERIFY_COST_MS, fixed[1], 0.0
+
+    def _spec_widths_from_survival(
+        self, survival: torch.Tensor, other_rows: int = 0
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Verify width per request that maximizes expected accepted tokens/ms.
+
+        A step costs ``t0 + c_row * rows`` ms and yields ``expected`` tokens, so
+        batch throughput is ``Theta = expected / cost`` tokens/ms and one more
+        verified position costs ``c_row`` ms for a marginal ``S_j`` tokens. It is
+        worth verifying iff ``S_j > c_row * Theta``, so the optimum is the fixed
+        point of
+
+            widths <- #{j : S_j > c_row * expected(widths) / cost(widths)}
+
+        Both sides depend on the widths, hence the few iterations. ``S_1 = 0.72``
+        against ``c_row * Theta`` in the 0.10-0.55 range for batches of 1 to 12
+        requests, so the rule trades width against per-row cost instead of
+        assuming a width is always worth it: with the measured single-request
+        curve it lands on the empirically optimal width at one request and
+        shrinks towards 1 as the batch grows, the shape upstream hand-tunes in
+        ``num_speculative_tokens_per_batch_size``. Rows that are not draft rows
+        (a prefill chunk sharing the step) push the batch up its cost curve and
+        so are priced in through ``other_rows``.
+
+        The solve stays on the device: the caller takes one width copy per step,
+        because this sits in the async scheduling path where a host round trip
+        costs more than the arithmetic. ``t0`` and ``c_row`` come from
+        :meth:`_row_cost`, i.e. from the engine's own measurement of what a row
+        costs at the current load.
+        """
+        num_spec = survival.shape[1]
+        cost_model = self._row_cost()
+        if cost_model is None:
+            return None
+        t0, c_row, c_req, c_ragged = cost_model
+        nan = torch.tensor(float("nan"), device=survival.device)
+        if num_spec <= 0:
+            return torch.zeros(survival.shape[0], dtype=torch.long), nan
+        return solve_verify_widths(survival, t0, c_row, other_rows, c_req, c_ragged)
+
+    @staticmethod
+    def _non_draft_rows(input_batch: InputBatch) -> int:
+        """Rows in the step that are not per-request draft rows.
+
+        A mixed batch runs a prefill chunk alongside the decode rows; those rows
+        move the batch up its cost curve, so the width decision has to price
+        them even though the confidence head says nothing about them.
+        """
+        return max(
+            0,
+            input_batch.num_tokens
+            - input_batch.num_reqs
+            - input_batch.num_draft_tokens,
+        )
+
+    # 诊断探针的采样间隔（每 N 次决策打一行）。只是可观测性，不是决策超参。
+    _WIDTH_PROBE_EVERY = 5
+
+    def _probe_cost_fields(self) -> tuple:
+        """Cost parameters the diagnostic probe prints.
+
+        The probe is observability, not part of the decision contract, so it
+        fetches the cost model itself instead of having the solver thread its
+        internals back out to every caller.
+        """
+        cost_model = self._row_cost()
+        if cost_model is None:
+            return ("unknown", float("nan"), float("nan"), float("nan"))
+        t0, c_row, c_req, _ = cost_model
+        return ("online", t0, c_row, c_req)
+
+    def _recommend_spec_tokens(self, input_batch: InputBatch) -> int | None:
+        """Batch-wide verify width suggested by the DSpark confidence head.
+
+        The head emits a per-position conditional acceptance probability for each
+        proposed draft; positions the cost model in
+        :meth:`_spec_widths_from_survival` does not pay for are dropped. The
+        decision is non-anticipating: the buffer holds the drafts this step just
+        proposed, which are scheduled for the next one.
+        """
+        speculator = self.speculator
+        if speculator is None or not getattr(
+            speculator, "enable_confidence_head", False
+        ):
+            return None
+        num_reqs = input_batch.num_reqs
+        num_spec = self.num_speculative_steps
+        if num_reqs <= 0 or num_spec <= 0:
+            return None
+        probs = speculator.draft_token_confidence_probs
+        if probs.numel() == 0:
+            return None
+        survival = torch.cumprod(probs[:num_reqs, :num_spec].detach().float(), dim=1)
+        # This variant decides one width for the whole batch, so the cost model
+        # must see the whole batch: t0 is amortized over num_reqs requests, which
+        # is what makes a deep width cheap at a small batch. Hence the expand.
+        mean_survival = survival.mean(dim=0, keepdim=True).expand(num_reqs, -1)
+        solved = self._spec_widths_from_survival(
+            mean_survival, self._non_draft_rows(input_batch)
+        )
+        if solved is None:
+            return None
+        widths, theta = solved
+        keep = int(widths[0].item())
+        keep = min(keep, num_spec)
+        if envs.VLLM_DSPARK_CONFIDENCE_PROBE:
+            self._width_probe_calls = getattr(self, "_width_probe_calls", 0) + 1
+            if self._width_probe_calls % self._WIDTH_PROBE_EVERY == 0:
+                logger.info(
+                    "DSPARK_WIDTH_PROBE call=%d num_reqs=%d other_rows=%d "
+                    "keep=%d theta=%.4f cost=%s(%.2f,%.4f,%.4f)"
+                    " fit=%s surv=%s",
+                    self._width_probe_calls,
+                    num_reqs,
+                    self._non_draft_rows(input_batch),
+                    keep,
+                    float(theta),
+                    *self._probe_cost_fields(),
+                    self._cost_fit_state(),
+                    [round(v, 3) for v in mean_survival[0].tolist()],
+                )
+        return keep
+
+    def _recommend_spec_tokens_per_req(
+        self, input_batch: InputBatch
+    ) -> list[int] | None:
+        """Per-request verify width from the confidence head.
+
+        Same decision rule as the batch-wide variant, but taken on each
+        request's own survival curve: a request whose drafts look unlikely is
+        verified shallowly while a confident one keeps its full width. The
+        resulting batch is ragged, which the varlen decode graphs serve.
+        """
+        num_reqs = input_batch.num_reqs
+        num_spec = self.num_speculative_steps
+        if num_reqs <= 0 or num_spec <= 0:
+            return None
+        pattern = self._width_pattern()
+        if pattern is not None:
+            # Measurement mode: a fixed pattern holds the row count constant
+            # while varying only how ragged the batch is, which is what
+            # isolates the cost of serving mixed query lengths.
+            return [pattern[i % len(pattern)] for i in range(num_reqs)]
+        speculator = self.speculator
+        if speculator is None or not getattr(
+            speculator, "enable_confidence_head", False
+        ):
+            return None
+        probs = speculator.draft_token_confidence_probs
+        if probs.numel() == 0:
+            return None
+        survival = torch.cumprod(probs[:num_reqs, :num_spec].detach().float(), dim=1)
+        # 用引擎自己实测的（预测, 实现）配对校正存活曲线：头在尾部系统性低估
+        # （实测预测 0.07 的位置真实接受 20.8%），不校正会把该验的位置砍掉。
+        solved = self._spec_widths_from_survival(
+            survival, self._non_draft_rows(input_batch)
+        )
+        if solved is None:
+            # The engine has not measured its own cost curve yet; leaving the
+            # width alone is the honest answer.
+            return None
+        keep, theta = solved
+        widths = [min(int(k), num_spec) for k in keep.tolist()]
+        return widths
 
     @torch.inference_mode()
     @step_eplb_after()

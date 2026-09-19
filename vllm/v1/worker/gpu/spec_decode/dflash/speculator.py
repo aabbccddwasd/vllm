@@ -479,6 +479,13 @@ class DFlashSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode=batch_desc.cg_mode,
             )
 
+        # The confidence head is computed *inside* the draft graph, so its
+        # output buffer can only be read back here, after the replay. Any probe
+        # inserted in the captured region would run at capture time only.
+        probe_confidence = getattr(self, "_probe_confidence", None)
+        if probe_confidence is not None:
+            probe_confidence(num_reqs)
+
         return self.draft_tokens[:num_reqs]
 
 

@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -32,6 +33,7 @@ from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
+from vllm.profiler.graph_annotations import finish_capture, resolve_capture
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
 from vllm.utils.multi_stream_utils import vllm_cudagraph_capture_scope
@@ -492,6 +494,14 @@ class CudaGraphManager:
                             # forks copy_stream, but wait_prefetch only happens in
                             # the next forward pass.
                             get_offloader().join_after_forward()
+                            # Resolve the component scopes entered above while
+                            # the capture is still live; the pickle is written
+                            # after the context exits.
+                            resolve_capture()
+                        # Records which nodes each model component created, so a
+                        # later trace of a *replay* can be split per component.
+                        # No-op unless VLLM_GRAPH_KERNEL_ANNOTATIONS=1.
+                        finish_capture(graph)
                         if self._capture_mem_samples is not None:
                             torch.accelerator.synchronize()
                             free_after = torch.accelerator.get_memory_info()[0]
@@ -531,6 +541,33 @@ class CudaGraphManager:
                     num_ubatches,
                 ):
                     return desc
+        if envs.VLLM_RAGGED_DEBUG and num_tokens > 0:
+            # Why a batch missed every captured graph. The ragged (per-request
+            # widths differ) case lives here: it can only match a varlen
+            # descriptor, so a missing/mismatching capture shows up as an
+            # empty or all-incompatible candidate list.
+            cands = self._candidates.get(key) or []
+            logger.info(
+                "CG_MISS mgr=%d captured=%s n_graphs=%d key=(tokens=%d,loras=%d) "
+                "live=(reqs=%d,tokens=%d,uniform=%s,max_q=%s,ubatches=%d) "
+                "n_candidates=%d candidates=%s captured_tokens=%s",
+                id(self),
+                self._graphs_captured,
+                len(self.graphs),
+                key[0],
+                key[1],
+                num_reqs,
+                num_tokens,
+                uniform_token_count,
+                max_query_len,
+                num_ubatches,
+                len(cands),
+                [
+                    (d.num_tokens, d.num_reqs, d.uniform_token_count, d.max_query_len)
+                    for d in cands[:4]
+                ],
+                sorted({d.num_tokens for d in self.graphs}),
+            )
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,
             num_tokens=num_tokens,

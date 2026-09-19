@@ -303,6 +303,31 @@ if TYPE_CHECKING:
     # must be copied before the next is pulled.
     VLLM_INSTANTTENSOR_BACKEND: str = ""
     VLLM_INSTANTTENSOR_COPY: bool = True
+    # Capture decode graphs from varlen descriptors without adaptive
+    # verification, to test graph composition invariance on its own.
+    VLLM_FORCE_VARLEN_DECODE_CAPTURE: bool = False
+    # Log batches whose per-request token counts differ, and the descriptor and
+    # CUDA graph mode they land on.
+    VLLM_RAGGED_DEBUG: bool = False
+    # Let the DSpark confidence head run without adaptive verification. The head
+    # only predicts per-draft survival probabilities; nothing consumes them, so
+    # this changes no decision on its own.
+    VLLM_DSPARK_CONFIDENCE_HEAD: bool = False
+    # Drive the verify width from the confidence head: batch-wide
+    # (`..._WIDTH`) or per request (`..._WIDTH_PER_REQ`, which makes the verify
+    # batch ragged). Both are off; the solver prices a verify row against the
+    # batch's own measured cost.
+    VLLM_DSPARK_CONFIDENCE_WIDTH: bool = False
+    VLLM_DSPARK_CONFIDENCE_WIDTH_PER_REQ: bool = False
+    # Anchor for the verify-row cost fit (ms per verified row); the engine then
+    # measures its own intercept, per-request cost and ragged penalty.
+    VLLM_DSPARK_VERIFY_COST_MS: float = 0.592
+    # Test-only: feed a fixed width pattern (e.g. "1,5,1,5") instead of the
+    # solver, to build batches that differ only in raggedness.
+    VLLM_DSPARK_WIDTH_PATTERN: str = ""
+    # Diagnostic: log the confidence head's per-position survival curve and the
+    # widths it implies, to compare against the engine's measured acceptance.
+    VLLM_DSPARK_CONFIDENCE_PROBE: bool = False
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
@@ -1921,6 +1946,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_INSTANTTENSOR_BACKEND": lambda: os.getenv("VLLM_INSTANTTENSOR_BACKEND", ""),
     "VLLM_INSTANTTENSOR_COPY": lambda: bool(
         int(os.getenv("VLLM_INSTANTTENSOR_COPY", "1"))
+    ),
+    "VLLM_FORCE_VARLEN_DECODE_CAPTURE": lambda: bool(
+        int(os.getenv("VLLM_FORCE_VARLEN_DECODE_CAPTURE", "0"))
+    ),
+    "VLLM_RAGGED_DEBUG": lambda: bool(int(os.getenv("VLLM_RAGGED_DEBUG", "0"))),
+    "VLLM_DSPARK_CONFIDENCE_HEAD": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_CONFIDENCE_HEAD", "0"))
+    ),
+    "VLLM_DSPARK_CONFIDENCE_WIDTH": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_CONFIDENCE_WIDTH", "0"))
+    ),
+    "VLLM_DSPARK_CONFIDENCE_WIDTH_PER_REQ": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_CONFIDENCE_WIDTH_PER_REQ", "0"))
+    ),
+    "VLLM_DSPARK_VERIFY_COST_MS": lambda: float(
+        os.getenv("VLLM_DSPARK_VERIFY_COST_MS", "0.592")
+    ),
+    "VLLM_DSPARK_WIDTH_PATTERN": lambda: os.getenv("VLLM_DSPARK_WIDTH_PATTERN", ""),
+    "VLLM_DSPARK_CONFIDENCE_PROBE": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_CONFIDENCE_PROBE", "0"))
     ),
     # Used to force set up loopback IP
     "VLLM_LOOPBACK_IP": lambda: os.getenv("VLLM_LOOPBACK_IP", ""),

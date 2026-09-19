@@ -37,6 +37,39 @@ def _timing_event() -> torch.cuda.Event:
     return torch.cuda.Event(enable_timing=True)
 
 
+def _resolve_intervals(
+    events: list[tuple[torch.cuda.Event, int, int, bool, bool]],
+) -> list["StepIntervalSample"]:
+    """Turn recorded step starts into per-step wall times.
+
+    The last event is the newest, so waiting on it means every earlier interval
+    is complete and ``elapsed_time`` does not block.
+    """
+    if len(events) < 2:
+        return []
+    events[-1][0].synchronize()
+    return [
+        StepIntervalSample(start.elapsed_time(nxt[0]), rows, num_reqs, full, ragged)
+        for (start, rows, num_reqs, full, ragged), nxt in zip(events, events[1:])
+    ]
+
+
+@dataclass(frozen=True)
+class StepIntervalSample:
+    """Wall time of one served step, and the row count that drove it.
+
+    ``step_ms`` spans this step's start to the next step's start on the main
+    stream, so it carries the kernel time plus whatever gap the engine left in
+    between — the latency the scheduler actually pays.
+    """
+
+    step_ms: float
+    rows: int
+    num_reqs: int
+    full_cudagraph: bool
+    ragged: bool
+
+
 @dataclass
 class StepTimingEvents:
     forward_start: torch.cuda.Event = field(default_factory=_timing_event)
@@ -57,6 +90,9 @@ class StepTimingCollector:
         self._step: StepTimingEvents | None = None
         self._batch = (False, 0, 0)
         self._timed: list[tuple[StepTimingEvents, tuple[bool, int, int]]] = []
+        self._cost_events: list[tuple[torch.cuda.Event, int, int, bool, bool]] = []
+        self._cost_pending: list[tuple[torch.cuda.Event, int, int, bool, bool]] = []
+        self._cost_open = False
 
     @contextlib.contextmanager
     def collect(self) -> Iterator[list[StepTimingSample]]:
@@ -110,6 +146,58 @@ class StepTimingCollector:
             self._step.drafter_end.record()
             self._timed.append((self._step, self._batch))
             self._step = None
+
+    def open_cost_window(self) -> None:
+        """Start timing served steps until the window is closed."""
+        self._cost_events = []
+        self._cost_open = True
+
+    def record_cost_step(self, input_batch: "InputBatch", full_cudagraph: bool) -> bool:
+        """Time one served step; call right before the forward.
+
+        Returns False when the step closes the window instead of joining it,
+        which happens when the execution mode changes: mixing eager and graph
+        steps would fit one curve to two different machines.
+        """
+        if not self._cost_open:
+            return True
+        if not full_cudagraph:
+            return False
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        # Raggedness of the verify batch itself: requests with different draft
+        # counts run mixed query lengths, which the cost fit prices separately.
+        draft_counts = input_batch.num_draft_tokens_per_req
+        ragged = bool(
+            draft_counts is not None
+            and input_batch.num_reqs > 1
+            and int(draft_counts.max()) != int(draft_counts.min())
+        )
+        self._cost_events.append(
+            (
+                event,
+                input_batch.num_tokens_after_padding,
+                input_batch.num_reqs,
+                full_cudagraph,
+                ragged,
+            )
+        )
+        return True
+
+    def close_cost_window(self) -> list[StepIntervalSample]:
+        """Hand back the *previous* window, and stash this one behind it.
+
+        Resolving one window late is what makes the sampling free: by the time
+        the next window opens, every event of the stashed one has long completed,
+        so the single synchronization never waits. Resolving on the spot would
+        stall the host for a step — the very thing async scheduling exists to
+        avoid — once per window.
+        """
+        samples = _resolve_intervals(self._cost_pending)
+        self._cost_pending = self._cost_events
+        self._cost_events = []
+        self._cost_open = False
+        return samples
 
 
 class AsyncOutput(AsyncModelRunnerOutput):
