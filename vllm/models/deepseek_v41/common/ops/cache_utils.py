@@ -721,6 +721,8 @@ def compute_global_topk_indices_and_lens(
     block_table: torch.Tensor,
     block_size: int,
     is_valid_token: torch.Tensor,
+    out_indices: torch.Tensor | None = None,
+    out_lens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Map local topk indices to global KV cache slots and count valid entries.
 
@@ -734,11 +736,50 @@ def compute_global_topk_indices_and_lens(
     non-negative, but a slot they never wrote keeps whatever the buffer held, so
     translating such an entry would index the block table out of bounds and hand
     the sparse-MLA kernels a slot outside the KV cache.
+
+    Args:
+        topk_indices: Local indices, ``[num_tokens, topk]``; padding is negative.
+        token_to_req_indices: Request index owning each token.
+        block_table: The requests' block tables, ``[num_reqs, blocks_per_req]``.
+        block_size: Tokens per block, used to turn a block number into a slot.
+        is_valid_token: Whether each token takes part in the step.
+        out_indices: Optional preallocated destination, shape broadcastable to
+            ``topk_indices`` (at least ``num_tokens`` rows). Callers inside a
+            CUDA graph must pass a persistent buffer so the result never lands
+            in a fresh graph-pool allocation.
+        out_lens: Optional preallocated destination for the per-token lengths.
+
+    Returns:
+        ``(global_topk_indices, topk_lens)``, either the caller's buffers or
+        freshly allocated ones.
+
     """
     num_tokens = topk_indices.shape[0]
     max_local_index = block_table.shape[1] * block_size
-    global_topk_indices = torch.empty_like(topk_indices)
-    topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
+    if out_indices is None:
+        global_topk_indices = torch.empty_like(topk_indices)
+    else:
+        assert out_indices.shape[-1] == topk_indices.shape[-1], (
+            f"out_indices width {out_indices.shape[-1]} must match topk width "
+            f"{topk_indices.shape[-1]}"
+        )
+        assert out_indices.shape[0] >= num_tokens, (
+            f"out_indices has {out_indices.shape[0]} rows, needs {num_tokens}"
+        )
+        assert out_indices.dtype == topk_indices.dtype
+        assert out_indices.device == topk_indices.device
+        global_topk_indices = out_indices[:num_tokens]
+    if out_lens is None:
+        topk_lens = torch.empty(
+            num_tokens, dtype=torch.int32, device=topk_indices.device
+        )
+    else:
+        assert out_lens.shape[0] >= num_tokens, (
+            f"out_lens has {out_lens.shape[0]} entries, needs {num_tokens}"
+        )
+        assert out_lens.dtype == torch.int32
+        assert out_lens.device == topk_indices.device
+        topk_lens = out_lens[:num_tokens]
     _compute_global_topk_indices_and_lens_kernel[(num_tokens,)](
         global_topk_indices,
         global_topk_indices.stride(0),
