@@ -16,6 +16,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.warmup.b12x_warmup import b12x_warmup
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
+from vllm.model_executor.warmup.deepseek_v4_candidate_blocks_warmup import (
+    deepseek_v4_candidate_blocks_warmup,
+)
 from vllm.model_executor.warmup.deepseek_v4_engram_warmup import (
     deepseek_v4_engram_warmup,
 )
@@ -202,6 +205,20 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         worker.get_model(),
         max_tokens=worker.scheduler_config.max_num_batched_tokens,
         cudagraph_capture_sizes=cudagraph_capture_sizes,
+    )
+
+    # DSv4.1 candidate-block scoring runs on both the prefill and the decode
+    # path with a per-call-site constexpr tuple, so warm both. The speculative
+    # row repeat is a runtime value, so warm it for the configured width too.
+    # No-op without candidate-block indexers.
+    speculative_config = worker.vllm_config.speculative_config
+    deepseek_v4_candidate_blocks_warmup(
+        worker.get_model(),
+        spec_token_counts=(
+            (int(speculative_config.num_speculative_tokens or 0),)
+            if speculative_config is not None
+            else (0,)
+        ),
     )
 
     # Run next so input-prep kernels JIT against pristine runner state.

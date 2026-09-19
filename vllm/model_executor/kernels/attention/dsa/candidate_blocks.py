@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Iterable
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -233,3 +235,46 @@ def apply_candidate_mask(
         row_repeat,
         1024,
     )
+
+
+def warmup_candidate_block_kernels(
+    *,
+    device: torch.device,
+    width: int,
+    candidates_width: int,
+    block_size: int,
+    row_repeats: Iterable[int] = (1,),
+    with_row_starts: Iterable[bool] = (False, True),
+) -> None:
+    """Compile every candidate-block launch signature ahead of serving.
+
+    The Triton compile key is the constexpr tuple (block size, tile, row repeat,
+    whether ``row_ks`` is present); the row and column counts are runtime
+    values. Serving reaches two families of signatures -- the prefill one
+    (``row_ks`` present, repeat 1) and the decode one (``row_ks`` absent,
+    repeat = speculative width) -- so warm each combination here rather than
+    paying a compile inside the first step.
+    """
+    for row_repeat in dict.fromkeys(int(r) for r in row_repeats if int(r) >= 1):
+        rows = 2 * row_repeat
+        bounds = torch.full(
+            (rows // row_repeat,), width, dtype=torch.int32, device=device
+        )
+        for starts in with_row_starts:
+            logits = torch.zeros((rows, width), dtype=torch.float32, device=device)
+            row_ks = torch.zeros_like(bounds) if starts else None
+            candidates = torch.empty(
+                (rows, candidates_width), dtype=torch.int32, device=device
+            )
+            select_candidate_blocks(
+                logits,
+                row_ks,
+                bounds,
+                candidates_width,
+                block_size,
+                candidates,
+                row_repeat,
+            )
+            apply_candidate_mask(
+                logits, row_ks, bounds, candidates, block_size, row_repeat
+            )
