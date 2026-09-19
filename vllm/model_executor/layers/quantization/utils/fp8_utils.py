@@ -142,6 +142,7 @@ def _silu_mul_quant_fp8_packed_kernel(
     input_ptr,
     output_q_ptr,
     output_scale_ptr,
+    row_idx_ptr,
     M,
     input_stride_m,
     output_q_stride_m,
@@ -158,6 +159,7 @@ def _silu_mul_quant_fp8_packed_kernel(
     PACKS_PER_CTA: tl.constexpr,
     BLOCK_M: tl.constexpr,
     HAS_CLAMP: tl.constexpr,
+    INDEXED: tl.constexpr,
 ):
     GROUPS_PER_PACK: tl.constexpr = 4
     hidden_size: tl.constexpr = N // 2
@@ -177,8 +179,12 @@ def _silu_mul_quant_fp8_packed_kernel(
 
     # persistent with grid_m-stride loop
     while row_start < M:
-        rows = row_start + row_offsets
-        row_mask = rows < M
+        offs = row_start + row_offsets
+        row_mask = offs < M
+        if INDEXED:
+            rows = tl.load(row_idx_ptr + offs, mask=row_mask, other=0).to(tl.int64)
+        else:
+            rows = offs.to(tl.int64)
         input_row_start = rows[:, None] * input_stride_m
         output_row_start = rows[:, None] * output_q_stride_m
 
@@ -254,11 +260,27 @@ def silu_mul_quant_fp8_packed_triton(
     clamp_limit: float | None = None,
     alpha: float = 1.0,
     beta: float = 0.0,
+    row_idx: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused gated activation + UE8M0 FP8 quant.
+
+    ``row_idx`` restricts the work to a subset of rows of ``input``/``output_q``
+    and writes the results back at those same row positions. The MoE grouped
+    layout pads every expert slot to ``align`` rows, so only ``M*topk`` of the
+    ``M_sum`` rows are ever read by the following grouped GEMM; passing
+    ``inv_perm`` here keeps the CUDA-graph grid at the useful row count instead
+    of the padded one.
+    """
     assert input.dim() == 2
     assert input.is_contiguous()
 
     M, N = input.shape
+    # ``M`` 始终是输入/输出张量的行数（= M_sum，padding 后的槽位总行数），scale 的
+    # MN-major 步长要按它算；``M_work`` 才是实际要做功的行数（= row_idx 的长度）。
+    M_work = M
+    if row_idx is not None:
+        assert row_idx.dtype == torch.int32 and row_idx.is_contiguous()
+        M_work = row_idx.numel()
     hidden_size = N // 2
 
     assert hidden_size % group_size == 0
@@ -292,15 +314,20 @@ def silu_mul_quant_fp8_packed_triton(
         packs_per_cta = 2 if M < 512 else 1
 
     grid_n = triton.cdiv(packs_per_row, packs_per_cta)
-    grid_m = min(triton.cdiv(M, BM), 4096)
+    grid_m = min(triton.cdiv(M_work, BM), 4096)
     grid = (grid_n, grid_m)
 
     has_clamp = clamp_limit is not None
+    if row_idx is None:
+        row_idx_buf = torch.empty(1, dtype=torch.int32, device=input.device)
+    else:
+        row_idx_buf = row_idx
     _silu_mul_quant_fp8_packed_kernel[grid](
         input,
         output_q,
         output_scale_packed,
-        M,
+        row_idx_buf,
+        M_work,
         input.stride(0),
         output_q.stride(0),
         output_scale_packed.stride(1),
@@ -316,6 +343,7 @@ def silu_mul_quant_fp8_packed_triton(
         PACKS_PER_CTA=packs_per_cta,
         BLOCK_M=BM,
         HAS_CLAMP=has_clamp,
+        INDEXED=row_idx is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )

@@ -3,6 +3,7 @@
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -37,6 +38,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp8Static,
 )
 from vllm.platforms import current_platform
+from vllm.profiler.gemm_shapes import note_gemm
+from vllm.profiler.graph_annotations import graph_kernel_scope
 from vllm.utils.deep_gemm import (
     DeepGemmQuantScaleFMT,
     get_mk_alignment_for_contiguous_layout,
@@ -244,7 +247,11 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         return (workspace1, workspace2, output)
 
     def _act_mul_quant(
-        self, input: torch.Tensor, output: torch.Tensor, activation: MoEActivation
+        self,
+        input: torch.Tensor,
+        output: torch.Tensor,
+        activation: MoEActivation,
+        row_idx: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self.block_shape is not None
         block_k = self.block_shape[1]
@@ -271,6 +278,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                     clamp_limit=self.gemm1_clamp_limit,
                     alpha=self.gemm1_alpha,
                     beta=self.gemm1_beta,
+                    row_idx=row_idx,
                 )
             act_out = torch.empty(
                 (M_sum, activation_out_dim), dtype=input.dtype, device=input.device
@@ -349,18 +357,19 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         a1q_perm = _resize_cache(
             workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, K)
         )
-        a1q, a1q_scale, expert_ids, inv_perm, align_used = deepgemm_moe_permute(
-            aq=a1q,
-            aq_scale=a1q_scale,
-            topk_ids=topk_ids,
-            local_num_experts=local_num_experts,
-            expert_map=expert_map,
-            expert_tokens_meta=expert_tokens_meta,
-            aq_out=a1q_perm,
-            # MXFP8 uses a 32-element activation-scale group (block_shape[1]);
-            # FP8-block keeps the default (128) alignment.
-            block_size=self.block_shape[1] if self.mxfp8 else None,
-        )
+        with graph_kernel_scope({"component": "moe.permute_quant"}):
+            a1q, a1q_scale, expert_ids, inv_perm, align_used = deepgemm_moe_permute(
+                aq=a1q,
+                aq_scale=a1q_scale,
+                topk_ids=topk_ids,
+                local_num_experts=local_num_experts,
+                expert_map=expert_map,
+                expert_tokens_meta=expert_tokens_meta,
+                aq_out=a1q_perm,
+                # MXFP8 uses a 32-element activation-scale group (block_shape[1]);
+                # FP8-block keeps the default (128) alignment.
+                block_size=self.block_shape[1] if self.mxfp8 else None,
+            )
         assert a1q.size(0) == M_sum
 
         # MXFP8 (1x32) drives the fp8_fp4-aliased grouped GEMM with recipe
@@ -376,42 +385,53 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         # under cudagraph replay.
         with mk_alignment_scope(align_used):
             mm1_out = _resize_cache(workspace2, (M_sum, N))
-            m_grouped_fp8_gemm_nt_contiguous(
-                (a1q, a1q_scale),
-                (w1, self.w1_scale),
-                mm1_out,
-                expert_ids,
-                **gemm_kwargs,
-            )
+            with graph_kernel_scope({"component": "moe.gemm1"}):
+                m_grouped_fp8_gemm_nt_contiguous(
+                    (a1q, a1q_scale),
+                    (w1, self.w1_scale),
+                    mm1_out,
+                    expert_ids,
+                    **gemm_kwargs,
+                )
 
             activation_out_dim = self.adjust_N_for_activation(N, activation)
             quant_out = _resize_cache(
                 workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, activation_out_dim)
             )
-            a2q, a2q_scale = self._act_mul_quant(
-                input=mm1_out.view(-1, N), output=quant_out, activation=activation
-            )
+            with graph_kernel_scope({"component": "moe.act_quant"}):
+                a2q, a2q_scale = self._act_mul_quant(
+                    input=mm1_out.view(-1, N),
+                    output=quant_out,
+                    activation=activation,
+                    row_idx=(
+                        inv_perm.reshape(-1).to(torch.int32).contiguous()
+                        if envs.VLLM_ACT_QUANT_INDEXED
+                        else None
+                    ),
+                )
 
             mm2_out = _resize_cache(workspace2, (M_sum, K))
-            m_grouped_fp8_gemm_nt_contiguous(
-                (a2q, a2q_scale),
-                (w2, self.w2_scale),
-                mm2_out,
-                expert_ids,
-                **gemm_kwargs,
-            )
+            with graph_kernel_scope({"component": "moe.gemm2"}):
+                m_grouped_fp8_gemm_nt_contiguous(
+                    (a2q, a2q_scale),
+                    (w2, self.w2_scale),
+                    mm2_out,
+                    expert_ids,
+                    **gemm_kwargs,
+                )
 
         if apply_router_weight_on_input:
             topk_weights = torch.ones_like(topk_weights)
 
-        deepgemm_unpermute_and_reduce(
-            a=mm2_out,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            inv_perm=inv_perm,
-            expert_map=expert_map,
-            output=output,
-        )
+        with graph_kernel_scope({"component": "moe.unpermute"}):
+            deepgemm_unpermute_and_reduce(
+                a=mm2_out,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                inv_perm=inv_perm,
+                expert_map=expert_map,
+                output=output,
+            )
 
 
 class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
@@ -515,7 +535,11 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         return (workspace1, workspace2, output)
 
     def _act_mul_quant(
-        self, input: torch.Tensor, output: torch.Tensor, activation: MoEActivation
+        self,
+        input: torch.Tensor,
+        output: torch.Tensor,
+        activation: MoEActivation,
+        row_idx: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         block_k = self._ACT_BLOCK_K
         scale_fmt = DeepGemmQuantScaleFMT.from_oracle()
@@ -531,6 +555,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                     output_q=output,
                     group_size=block_k,
                     clamp_limit=self.gemm1_clamp_limit,
+                    row_idx=row_idx,
                 )
             use_ue8m0 = scale_fmt == DeepGemmQuantScaleFMT.FLOAT32_CEIL_UE8M0
             return silu_mul_per_token_group_quant_fp8_colmajor(
@@ -604,15 +629,16 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         a1q_perm = _resize_cache(
             workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, K)
         )
-        a1q, a1q_scale, expert_ids, inv_perm, align_used = deepgemm_moe_permute(
-            aq=a1q,
-            aq_scale=a1q_scale,
-            topk_ids=topk_ids,
-            local_num_experts=local_num_experts,
-            expert_map=expert_map,
-            expert_tokens_meta=expert_tokens_meta,
-            aq_out=a1q_perm,
-        )
+        with graph_kernel_scope({"component": "moe.permute_quant"}):
+            a1q, a1q_scale, expert_ids, inv_perm, align_used = deepgemm_moe_permute(
+                aq=a1q,
+                aq_scale=a1q_scale,
+                topk_ids=topk_ids,
+                local_num_experts=local_num_experts,
+                expert_map=expert_map,
+                expert_tokens_meta=expert_tokens_meta,
+                aq_out=a1q_perm,
+            )
         assert a1q.size(0) == M_sum
 
         # Cap DG's BLOCK_M heuristic at the workspace's per-expert alignment;
@@ -621,43 +647,68 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
             # FC1: FP8 activations x FP4 weights
             # DeepGEMM 2.4.2 requires FP4-packed weights as int8 (kPackedFP4).
             mm1_out = _resize_cache(workspace2, (M_sum, N))
-            m_grouped_fp8_fp4_gemm_nt_contiguous(
-                (a1q, a1q_scale),
-                (w1.view(torch.int8), self.w1_scale),
-                mm1_out,
-                expert_ids,
-                recipe_a=(1, self._ACT_BLOCK_K),
-                recipe_b=(1, self._WEIGHT_BLOCK_K),
-            )
+            with graph_kernel_scope({"component": "moe.gemm1"}):
+                note_gemm(
+                    "deepgemm.fp8_fp4_moe_gemm1",
+                    M=M_sum,
+                    N=N,
+                    K=K,
+                    local_experts=local_num_experts,
+                )
+                m_grouped_fp8_fp4_gemm_nt_contiguous(
+                    (a1q, a1q_scale),
+                    (w1.view(torch.int8), self.w1_scale),
+                    mm1_out,
+                    expert_ids,
+                    recipe_a=(1, self._ACT_BLOCK_K),
+                    recipe_b=(1, self._WEIGHT_BLOCK_K),
+                )
 
             # SwiGLU activation + FP8 requant
             activation_out_dim = self.adjust_N_for_activation(N, activation)
             quant_out = _resize_cache(
                 workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, activation_out_dim)
             )
-            a2q, a2q_scale = self._act_mul_quant(
-                input=mm1_out.view(-1, N), output=quant_out, activation=activation
-            )
+            with graph_kernel_scope({"component": "moe.act_quant"}):
+                a2q, a2q_scale = self._act_mul_quant(
+                    input=mm1_out.view(-1, N),
+                    output=quant_out,
+                    activation=activation,
+                    row_idx=(
+                        inv_perm.reshape(-1).to(torch.int32).contiguous()
+                        if envs.VLLM_ACT_QUANT_INDEXED
+                        else None
+                    ),
+                )
 
             # FC2: FP8 activations x FP4 weights
             mm2_out = _resize_cache(workspace2, (M_sum, K))
-            m_grouped_fp8_fp4_gemm_nt_contiguous(
-                (a2q, a2q_scale),
-                (w2.view(torch.int8), self.w2_scale),
-                mm2_out,
-                expert_ids,
-                recipe_a=(1, self._ACT_BLOCK_K),
-                recipe_b=(1, self._WEIGHT_BLOCK_K),
-            )
+            with graph_kernel_scope({"component": "moe.gemm2"}):
+                note_gemm(
+                    "deepgemm.fp8_fp4_moe_gemm2",
+                    M=M_sum,
+                    N=K,
+                    K=self.adjust_N_for_activation(N, activation),
+                    local_experts=local_num_experts,
+                )
+                m_grouped_fp8_fp4_gemm_nt_contiguous(
+                    (a2q, a2q_scale),
+                    (w2.view(torch.int8), self.w2_scale),
+                    mm2_out,
+                    expert_ids,
+                    recipe_a=(1, self._ACT_BLOCK_K),
+                    recipe_b=(1, self._WEIGHT_BLOCK_K),
+                )
 
         if apply_router_weight_on_input:
             topk_weights = torch.ones_like(topk_weights)
 
-        deepgemm_unpermute_and_reduce(
-            a=mm2_out,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            inv_perm=inv_perm,
-            expert_map=expert_map,
-            output=output,
-        )
+        with graph_kernel_scope({"component": "moe.unpermute"}):
+            deepgemm_unpermute_and_reduce(
+                a=mm2_out,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                inv_perm=inv_perm,
+                expert_map=expert_map,
+                output=output,
+            )

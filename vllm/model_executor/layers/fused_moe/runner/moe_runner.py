@@ -46,6 +46,8 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExpertsOrder,
 )
 from vllm.platforms import current_platform
+from vllm.profiler.gemm_shapes import note_gemm
+from vllm.profiler.graph_annotations import graph_kernel_scope
 from vllm.utils.torch_utils import (
     _USE_LAYERNAME,
     LayerName,
@@ -622,12 +624,13 @@ class MoERunner(MoERunnerInterface):
             )
         else:
             # Modular kernels: select experts first, then call routed_experts
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_indices_dtype=self._quant_method.topk_indices_dtype,
-                input_ids=input_ids,
-            )
+            with graph_kernel_scope({"component": "moe.route"}):
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                    input_ids=input_ids,
+                )
 
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,
@@ -888,9 +891,10 @@ class MoERunner(MoERunnerInterface):
         # before routed expert dispatch.
         shared_experts_overlapping = False
         if self._shared_experts is not None:
-            shared_experts_overlapping = self._shared_experts.maybe_forward_async(
-                shared_experts_input
-            )
+            with graph_kernel_scope({"component": "moe.shared"}):
+                shared_experts_overlapping = self._shared_experts.maybe_forward_async(
+                    shared_experts_input
+                )
 
         # If the Runner holds the gate, apply it after the stream sync,
         # so it can run overlapped with the
@@ -898,9 +902,18 @@ class MoERunner(MoERunnerInterface):
         if self.gate is not None:
             if self._fse_fuse_gate:
                 self._maybe_fuse_gate_weights()
-                router_logits = F.linear(hidden_states, self._combined_gate_weight)
+                with graph_kernel_scope({"component": "moe.gate"}):
+                    router_logits = F.linear(hidden_states, self._combined_gate_weight)
             else:
-                router_logits, _ = self.gate(hidden_states)
+                with graph_kernel_scope({"component": "moe.gate"}):
+                    note_gemm(
+                        "gate",
+                        M=hidden_states.shape[0],
+                        N=getattr(self.gate, "num_experts", 0)
+                        or hidden_states.shape[0],
+                        K=hidden_states.shape[-1],
+                    )
+                    router_logits, _ = self.gate(hidden_states)
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once
