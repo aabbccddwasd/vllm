@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm.profiler.gemm_shapes import note_gemm
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -170,6 +171,12 @@ def mhc_pre_delayed_tilelang(
         n_splits, num_tokens, dtype=torch.float32, device=residual.device
     )
     if use_deep_gemm:
+        note_gemm(
+            "deepgemm.tf32_hc_prenorm",
+            M=x.numel() // x.shape[-1],
+            N=fn.shape[0],
+            K=fn.shape[1],
+        )
         tf32_hc_prenorm_gemm(x, fn, mixes, sqrsum, n_splits)
     else:
         _HC_PRENORM_GEMM_TILELANG_KERNEL(

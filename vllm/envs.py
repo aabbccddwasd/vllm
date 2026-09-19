@@ -260,6 +260,17 @@ if TYPE_CHECKING:
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
     VLLM_ZERO_ALL_KV_AFTER_CAPTURE: bool = False
+    # Name the CUDA graph nodes a model component creates, so a trace of a graph
+    # *replay* can still be split per component. Needs a driver with
+    # cudaGraphNodeGetToolsId; inert (no-op) when unavailable.
+    VLLM_GRAPH_KERNEL_ANNOTATIONS: bool = False
+    VLLM_GRAPH_KERNEL_ANNOTATION_DIR: str = ""
+    # Log every GEMM call site's (M, N, K) once, to drive kernel microbenchmarks
+    # with the shapes the server really uses.
+    VLLM_GEMM_SHAPE_LOG: bool = False
+    VLLM_GEMM_SHAPE_LOG_PATH: str = ""
+    # Log every collective's (group, shape, dtype) once, to size comm budgets.
+    VLLM_COMM_SHAPE_LOG: bool = False
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
@@ -1843,6 +1854,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ZERO_ALL_KV_AFTER_CAPTURE": lambda: bool(
         int(os.getenv("VLLM_ZERO_ALL_KV_AFTER_CAPTURE", "0"))
     ),
+    # Profiling aids. All of them are inert unless explicitly enabled: the
+    # annotation scopes and the shape log only record, never change a decision.
+    "VLLM_GRAPH_KERNEL_ANNOTATIONS": lambda: bool(
+        int(os.getenv("VLLM_GRAPH_KERNEL_ANNOTATIONS", "0"))
+    ),
+    "VLLM_GRAPH_KERNEL_ANNOTATION_DIR": lambda: os.getenv(
+        "VLLM_GRAPH_KERNEL_ANNOTATION_DIR", ""
+    ),
+    "VLLM_GEMM_SHAPE_LOG": lambda: bool(int(os.getenv("VLLM_GEMM_SHAPE_LOG", "0"))),
+    "VLLM_GEMM_SHAPE_LOG_PATH": lambda: os.getenv("VLLM_GEMM_SHAPE_LOG_PATH", ""),
+    "VLLM_COMM_SHAPE_LOG": lambda: bool(int(os.getenv("VLLM_COMM_SHAPE_LOG", "0"))),
     # Used to force set up loopback IP
     "VLLM_LOOPBACK_IP": lambda: os.getenv("VLLM_LOOPBACK_IP", ""),
     # Used to set the process name prefix for vLLM processes.

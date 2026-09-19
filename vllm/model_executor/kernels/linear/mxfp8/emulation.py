@@ -9,6 +9,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_SCALE_DTYPE,
     dequant_mxfp8_to_bf16,
 )
+from vllm.profiler.gemm_shapes import note_gemm
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
@@ -54,6 +55,15 @@ class EmulationMxfp8LinearKernel(Mxfp8LinearKernel):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         weight = layer.weight
+        note_gemm(
+            "mxfp8.emulation_bf16",
+            M=x.shape[0] if hasattr(x, "shape") else -1,
+            N=weight.shape[0],
+            K=weight.shape[1],
+            layer=type(layer).__name__,
+            prefix=getattr(layer, "prefix", ""),
+            bmm=getattr(layer, "bmm_batch_size", None) or 0,
+        )
         # Load-time dequant path: weights are already BF16/FP16 (>= 2-byte), so
         # run a plain linear -- no per-step dequant. (MXFP8 weights are 1-byte.)
         if weight.element_size() >= 2:

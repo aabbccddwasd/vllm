@@ -193,6 +193,32 @@ def resume_device_comms() -> None:
     _apply_to_device_comms(lambda comm: comm.resume())
 
 
+_COMM_LOGGED: set[tuple] = set()
+
+
+def _note_collective(kind: str, group_name: str, world: int, tensor: Any) -> None:
+    """一次性打印每个集合通信的 (组, 形状, dtype, 字节数)。
+
+    TP 与 EP 在 MoE 上都只做**一次** all-reduce，但实测 EP 单次耗时是 TP 的
+    2.3 倍：kernel 几何完全相同，所以差别只能来自 payload 或等待。这个日志给出
+    payload 的确定值，而不用从耗时反推。用 ``VLLM_COMM_SHAPE_LOG=1`` 打开。
+    """
+    import vllm.envs as _envs
+
+    if not _envs.VLLM_COMM_SHAPE_LOG or not isinstance(tensor, torch.Tensor):
+        return
+    key = (kind, group_name, tuple(tensor.shape), str(tensor.dtype))
+    if key in _COMM_LOGGED:
+        return
+    _COMM_LOGGED.add(key)
+    nbytes = tensor.numel() * tensor.element_size()
+    print(
+        f"[comm-shapes] {kind:14s} group={group_name} world={world} "
+        f"shape={tuple(tensor.shape)} {tensor.dtype} {nbytes / 1024:.1f} KB",
+        flush=True,
+    )
+
+
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
@@ -737,6 +763,7 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
+        _note_collective("all_reduce", self.unique_name, self.world_size, input_)
         if self.use_custom_op_call:
             return torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
         else:
