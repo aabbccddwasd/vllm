@@ -5,7 +5,6 @@ from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from typing import Any
 
-import vllm.envs as envs
 from vllm.model_executor.kernels.mhc.tilelang_kernels import (
     compute_num_split,
     mhc_pre_big_fuse_with_norm_tilelang,
@@ -18,13 +17,13 @@ from vllm.utils.math_utils import cdiv
 
 def compute_mhc_pre_num_splits(input_size: int, num_tokens: int) -> int:
     splits = compute_num_split(64, input_size, cdiv(num_tokens, 64))
-    # Snap onto a fixed ladder (1/4/16/cap) rather than capping. Both the GEMM and
+    # Snap onto a fixed ladder (1/4/16/64) rather than capping. Both the GEMM and
     # the fused normalization are compiled per ``n_splits``, and the natural value
     # changes at every 64-token boundary -- passing it through would compile one
     # variant per boundary (25 of them for max_num_batched_tokens=8192) instead of
     # four. Every rung must divide ``input_size``: both the tilelang fallback and
     # the DeepGEMM kernel split K evenly across the splits.
-    cap = max(16, envs.VLLM_MHC_PRE_MAX_SPLITS)
+    cap = 64
     for rung in (1, 4, 16, cap):
         if splits <= rung and input_size % rung == 0:
             return rung

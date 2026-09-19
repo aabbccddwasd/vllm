@@ -278,32 +278,9 @@ if TYPE_CHECKING:
     # torch allocation and non-torch memory -- to attribute what the KV cache
     # budget is actually spent on.
     VLLM_MEM_LOG: bool = False
-    # Store w13 (gate/up) at the model's exact, unrounded N for the DeepGEMM
-    # MXFP4 backend. Rounding costs 1152 -> 1280 rows on a TP4 DeepSeek-V4.1
-    # rank, i.e. ~11% of the w13 weights resident as zero rows. w2's reduction
-    # dim stays 128-rounded since the mixed FP8xFP4 GEMM requires K % 128 == 0.
-    VLLM_MXFP4_MOE_COMPACT_W13: bool = False
     # MXFP8 kernel policy. "" keeps upstream selection; "auto" picks the fastest
     # bit-exact backend per shape; "b12x_tuned" forces the tuned family-12 kernel.
     VLLM_MXFP8_BACKEND_POLICY: str = ""
-    # Force split-K slices for the b12x_tuned MXFP8 kernel; 0 = per-shape policy.
-    VLLM_MXFP8_SPLIT_K: int = 0
-    # wo_a grouped projection: per-group torch.mm instead of torch.bmm when the
-    # batch is small enough that cuBLAS's batched heuristic picks a bad kernel.
-    # Same math per group, measured -0.12/-0.22 ms per step at conc 4/16 on
-    # 4x RTX PRO 6000, so it is on by default.
-    VLLM_O_PROJ_GROUPED_MM: bool = True
-    # Write the per-group result straight into `z[:, g, :]` instead of a
-    # transposed copy: same values, one kernel less per layer.
-    VLLM_O_PROJ_DIRECT_WRITE: bool = True
-    # Fused act-quant over the rows a grouped layout actually reads, skipping the
-    # padded slots whose outputs the following grouped GEMM never consumes.
-    VLLM_ACT_QUANT_INDEXED: bool = True
-    # Top rung of the mHC prenorm split ladder; 16 is the upstream value.
-    VLLM_MHC_PRE_MAX_SPLITS: int = 16
-    # Run the IR rms_norm op instead of its torch reference outside compiled
-    # regions. Changes which kernel produces the norm, so it stays opt-in.
-    VLLM_IR_RMS_NORM_EAGER_FUSED: bool = False
     # Drop a shard from the page cache once its weights have been consumed. Only
     # meaningful for checkpoints that do not fit in host memory alongside the
     # process; off by default.
@@ -1941,24 +1918,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_COMM_SHAPE_LOG": lambda: bool(int(os.getenv("VLLM_COMM_SHAPE_LOG", "0"))),
     "VLLM_MOE_PAD_LOG": lambda: bool(int(os.getenv("VLLM_MOE_PAD_LOG", "0"))),
     "VLLM_MEM_LOG": lambda: bool(int(os.getenv("VLLM_MEM_LOG", "0"))),
-    "VLLM_MXFP4_MOE_COMPACT_W13": lambda: bool(
-        int(os.getenv("VLLM_MXFP4_MOE_COMPACT_W13", "0"))
-    ),
     "VLLM_MXFP8_BACKEND_POLICY": lambda: os.getenv("VLLM_MXFP8_BACKEND_POLICY", ""),
-    "VLLM_MXFP8_SPLIT_K": lambda: int(os.getenv("VLLM_MXFP8_SPLIT_K", "0")),
-    "VLLM_O_PROJ_GROUPED_MM": lambda: bool(
-        int(os.getenv("VLLM_O_PROJ_GROUPED_MM", "1"))
-    ),
-    "VLLM_O_PROJ_DIRECT_WRITE": lambda: bool(
-        int(os.getenv("VLLM_O_PROJ_DIRECT_WRITE", "1"))
-    ),
-    "VLLM_ACT_QUANT_INDEXED": lambda: bool(
-        int(os.getenv("VLLM_ACT_QUANT_INDEXED", "1"))
-    ),
-    "VLLM_MHC_PRE_MAX_SPLITS": lambda: int(os.getenv("VLLM_MHC_PRE_MAX_SPLITS", "16")),
-    "VLLM_IR_RMS_NORM_EAGER_FUSED": lambda: bool(
-        int(os.getenv("VLLM_IR_RMS_NORM_EAGER_FUSED", "0"))
-    ),
     "VLLM_SAFETENSORS_DROP_CACHE": lambda: bool(
         int(os.getenv("VLLM_SAFETENSORS_DROP_CACHE", "0"))
     ),

@@ -79,8 +79,7 @@ class RMSNorm(CustomOp):
         """PyTorch-native implementation equivalent to forward()."""
         if residual is None:
             if (
-                envs.VLLM_IR_RMS_NORM_EAGER_FUSED
-                and self.variance_size_override is None
+                self.variance_size_override is None
                 and not torch.compiler.is_compiling()
             ):
                 # Outside a compiled region `ir.ops.rms_norm` falls back to its

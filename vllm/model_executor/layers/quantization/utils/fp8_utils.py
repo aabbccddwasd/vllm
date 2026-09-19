@@ -105,7 +105,7 @@ def _per_token_group_quant_fp8(
     assert y_num_columns % group_size == 0, (
         f"this quantizer needs a group-aligned width, got {y_num_columns} with "
         f"group_size {group_size}; the packed UE8M0 path handles a partial tail, "
-        "this one does not (see VLLM_MXFP4_MOE_COMPACT_W13)"
+        "this one does not; use the packed UE8M0 path instead"
     )
     groups_per_row = y_num_columns // group_size
 
@@ -570,7 +570,7 @@ def _per_token_group_quant_fp8_colmajor(
     assert y_num_columns % group_size == 0, (
         f"this quantizer needs a group-aligned width, got {y_num_columns} with "
         f"group_size {group_size}; the packed UE8M0 path handles a partial tail, "
-        "this one does not (see VLLM_MXFP4_MOE_COMPACT_W13)"
+        "this one does not; use the packed UE8M0 path instead"
     )
     groups_per_row = y_num_columns // group_size
 
@@ -784,7 +784,7 @@ def per_token_group_quant_fp8_packed_for_deepgemm(
     assert hidden_dim % group_size == 0, (
         f"this quantizer needs a group-aligned width, got {hidden_dim} with "
         f"group_size {group_size}; the packed UE8M0 path handles a partial tail, "
-        "this one does not (see VLLM_MXFP4_MOE_COMPACT_W13)"
+        "this one does not; use the packed UE8M0 path instead"
     )
     num_groups_per_row = hidden_dim // group_size
     k_num_packed_sf_k = (num_groups_per_row + 3) // 4

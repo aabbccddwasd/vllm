@@ -3,7 +3,6 @@
 import torch
 import torch.nn as nn
 
-import vllm.envs as envs
 from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
     fused_inv_rope_fp8_quant,
 )
@@ -18,8 +17,7 @@ _SMALL_BATCH_BMM_MAX_TOKENS = 64
 
 def _use_grouped_mm(n_groups: int, num_tokens: int) -> bool:
     return (
-        envs.VLLM_O_PROJ_GROUPED_MM
-        and 2 <= num_tokens <= _SMALL_BATCH_BMM_MAX_TOKENS
+        2 <= num_tokens <= _SMALL_BATCH_BMM_MAX_TOKENS
         and n_groups <= _SMALL_BATCH_BMM_MAX_GROUPS
     )
 
@@ -207,27 +205,13 @@ def deep_gemm_fp8_o_proj(
             # conc=16 -0.22 ms/step；conc=1 (T=1) 略负，故下界从 T=2 起。
             # 直接写进 z[:, g, :]：那是 z 的一个合法二维 strided 视图
             # (stride = (n_groups*o_lora_rank, 1))，cuBLAS 吃 ldc，所以不需要
-            # 中间缓冲 + copy_。原先的 per_group + transpose(0,1) copy 每层
-            # 多一个 kernel（实测 served 0.077 ms/step）。
-            # VLLM_O_PROJ_DIRECT_WRITE=0 走旧路径，供 served A/B 背靠背对比。
-            if envs.VLLM_O_PROJ_DIRECT_WRITE:
-                for g in range(n_groups):
-                    torch.mm(
-                        o_proj_input[:, g, :],
-                        grouped_weight[g].t(),
-                        out=z[:, g, :],
-                    )
-            else:
-                per_group = torch.empty(
-                    (n_groups, z.shape[0], o_lora_rank),
-                    device=z.device,
-                    dtype=z.dtype,
+            # 中间缓冲 + copy_（后者每层多一个 kernel，实测 served 0.077 ms/step）。
+            for g in range(n_groups):
+                torch.mm(
+                    o_proj_input[:, g, :],
+                    grouped_weight[g].t(),
+                    out=z[:, g, :],
                 )
-                for g in range(n_groups):
-                    torch.mm(
-                        o_proj_input[:, g, :], grouped_weight[g].t(), out=per_group[g]
-                    )
-                z.copy_(per_group.transpose(0, 1))
         else:
             torch.bmm(
                 o_proj_input.transpose(0, 1),

@@ -3,7 +3,6 @@
 
 import torch
 
-import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -403,11 +402,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                     input=mm1_out.view(-1, N),
                     output=quant_out,
                     activation=activation,
-                    row_idx=(
-                        inv_perm.reshape(-1).to(torch.int32).contiguous()
-                        if envs.VLLM_ACT_QUANT_INDEXED
-                        else None
-                    ),
+                    row_idx=inv_perm.reshape(-1).to(torch.int32).contiguous(),
                 )
 
             mm2_out = _resize_cache(workspace2, (M_sum, K))
@@ -686,11 +681,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                     input=mm1_out.view(-1, N),
                     output=quant_out,
                     activation=activation,
-                    row_idx=(
-                        inv_perm.reshape(-1).to(torch.int32).contiguous()
-                        if envs.VLLM_ACT_QUANT_INDEXED
-                        else None
-                    ),
+                    row_idx=inv_perm.reshape(-1).to(torch.int32).contiguous(),
                 )
 
             # FC2: FP8 activations x FP4 weights

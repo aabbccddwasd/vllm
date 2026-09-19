@@ -3,7 +3,6 @@
 
 import torch
 
-import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -476,32 +475,23 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         )
 
 
-def _compact_w13_intermediate_size(
+def _w13_intermediate_size(
     layer: RoutedExperts, intermediate_size_per_partition: int
 ) -> int:
-    """N of the fused gate/up weights, i.e. the exact size when compact.
+    """N of the fused gate/up weights, i.e. the exact size when it can be stored.
 
     ``intermediate_size_per_partition`` is the 128-rounded intermediate size
     that w2's reduction dim and the fused activation width are required to keep,
     because DeepGEMM's mixed FP8xFP4 GEMM asserts ``K % 128 == 0``. w13's N is
     read by the FC1 GEMM, which carries no such constraint, so the checkpoint's
-    exact per-rank size can be stored there and the zero gap rows skipped.
+    exact per-rank size is stored there and the zero gap rows never materialize.
     """
-    if not envs.VLLM_MXFP4_MOE_COMPACT_W13:
+    backend = getattr(layer.quant_method, "mxfp4_backend", None)
+    if backend != Mxfp4MoeBackend.DEEPGEMM_MXFP4:
         return intermediate_size_per_partition
     unpadded = layer.moe_config.intermediate_size_per_partition_unpadded
-    assert unpadded is not None, "compact w13 needs the unpadded intermediate size"
-    assert unpadded <= intermediate_size_per_partition, (
-        f"unpadded intermediate size {unpadded} exceeds the rounded one "
-        f"{intermediate_size_per_partition}"
-    )
-    if unpadded == intermediate_size_per_partition:
+    if unpadded is None or unpadded >= intermediate_size_per_partition:
         return intermediate_size_per_partition
-    backend = getattr(layer.quant_method, "mxfp4_backend", None)
-    assert backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4, (
-        "VLLM_MXFP4_MOE_COMPACT_W13 is only implemented for the DeepGEMM MXFP4 "
-        f"experts, got backend {backend}"
-    )
     return unpadded
 
 
@@ -612,7 +602,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.params_dtype = params_dtype
         layer.num_experts = num_experts
         self.intermediate_size = intermediate_size_per_partition
-        self.w13_intermediate_size = _compact_w13_intermediate_size(
+        self.w13_intermediate_size = _w13_intermediate_size(
             layer, intermediate_size_per_partition
         )
         self.hidden_size = hidden_size
@@ -723,8 +713,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             assert (
                 w13.dim() == 3
                 and w13.shape[0] == num_experts
-                and w13.shape[1]
-                == self.w13_intermediate_size * self.moe.w13_num_shards
+                and w13.shape[1] == self.w13_intermediate_size * self.moe.w13_num_shards
                 and w13.shape[2] == hidden_size // 2
             )
             assert (
