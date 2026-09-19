@@ -9,7 +9,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_SCALE_DTYPE,
     dequant_mxfp8_to_bf16,
 )
-from vllm.profiler.gemm_shapes import note_gemm
+from vllm.profiler.instrumentation import note_gemm
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 

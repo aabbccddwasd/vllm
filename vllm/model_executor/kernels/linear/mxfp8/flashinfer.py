@@ -19,7 +19,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp8Dynamic,
 )
 from vllm.platforms import current_platform
-from vllm.profiler.gemm_shapes import note_gemm
+from vllm.profiler.instrumentation import note_gemm
 from vllm.utils import flashinfer as vllm_flashinfer
 from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutedsl
 

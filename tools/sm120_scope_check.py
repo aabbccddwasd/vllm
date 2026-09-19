@@ -38,26 +38,18 @@ SM100_ONLY = [
 ]
 
 # 4. Switches added by this series and the default each must keep. `True` means
-# the switch has to be inert by default, which for a bool env means "0".
+# the switch has to be inert by default, which for a bool env means "0". After
+# the cleanup only the profiling aids and the MXFP8 policy survive: every other
+# switch either became the only code path or was dropped.
 CONSERVATIVE_DEFAULTS = {
-    "VLLM_ZERO_ALL_KV_AFTER_CAPTURE": "0",
+    "VLLM_PROFILE_DIR": '""',
     "VLLM_GRAPH_KERNEL_ANNOTATIONS": "0",
     "VLLM_GEMM_SHAPE_LOG": "0",
     "VLLM_COMM_SHAPE_LOG": "0",
+    "VLLM_MOE_PAD_LOG": "0",
+    "VLLM_MEM_LOG": "0",
+    "VLLM_KV_ACCOUNTING_LOG": "0",
     "VLLM_MXFP8_BACKEND_POLICY": '""',
-    "VLLM_MXFP8_SPLIT_K": "0",
-    "VLLM_MHC_PRE_MAX_SPLITS": "16",
-    "VLLM_IR_RMS_NORM_EAGER_FUSED": "0",
-    "VLLM_SAFETENSORS_DROP_CACHE": "0",
-    "VLLM_INSTANTTENSOR_BACKEND": '""',
-    "VLLM_FORCE_VARLEN_DECODE_CAPTURE": "0",
-    "VLLM_RAGGED_DEBUG": "0",
-    "VLLM_DSPARK_CONFIDENCE_HEAD": "0",
-    "VLLM_DSPARK_CONFIDENCE_WIDTH": "0",
-    "VLLM_DSPARK_CONFIDENCE_WIDTH_PER_REQ": "0",
-    "VLLM_DSPARK_CONFIDENCE_PROBE": "0",
-    "VLLM_DSPARK_WIDTH_PATTERN": '""',
-    "VLLM_DSPARK_FORCE_REJECT": "0",
 }
 
 # Names the code reads off `vllm.envs` (directly or through an alias) but that
@@ -101,9 +93,13 @@ def main() -> int:
     for line in diff.splitlines():
         if line.startswith("+++ b/"):
             current = line[6:]
-        elif line.startswith("+") and not line.startswith("+++"):
-            if current.startswith("vllm/") and current.endswith(".py"):
-                added.append(line[1:])
+        elif (
+            line.startswith("+")
+            and not line.startswith("+++")
+            and current.startswith("vllm/")
+            and current.endswith(".py")
+        ):
+            added.append(line[1:])
     failures: list[str] = []
 
     for pattern in SM100_ONLY:
@@ -116,7 +112,8 @@ def main() -> int:
 
     for name, (path, pattern) in GUARDS.items():
         try:
-            source = open(path).read()
+            with open(path) as handle:
+                source = handle.read()
         except OSError as exc:  # pragma: no cover - diagnostic path
             failures.append(f"{name}: cannot read {path}: {exc}")
             continue
@@ -124,7 +121,8 @@ def main() -> int:
             failures.append(f"{name}: missing in {path} (expected /{pattern}/)")
 
     # Collapse the source so multi-line lambdas match a single pattern.
-    envs = re.sub(r"\s+", " ", open("vllm/envs.py").read())
+    with open("vllm/envs.py") as handle:
+        envs = re.sub(r"\s+", " ", handle.read())
     for name, expected in CONSERVATIVE_DEFAULTS.items():
         match = re.search(
             rf'"{name}": lambda: [^;]*?os\.getenv\("{name}", "?([^",)]*)"?\)',
@@ -152,7 +150,9 @@ def main() -> int:
         for failure in failures:
             print(f"  - {failure}")
         return 1
-    print("sm120 scope check passed: no SM100-only code, guards present, defaults inert")
+    print(
+        "sm120 scope check passed: no SM100-only code, guards present, defaults inert"
+    )
     return 0
 
 

@@ -10,6 +10,7 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens
+from vllm.profiler.moe_layout import note_moe_layout, note_moe_padding
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
 from vllm.utils.math_utils import round_up
@@ -22,66 +23,6 @@ def expert_num_tokens_round_up_and_sum(
     # alignment.
     ent = (expert_num_tokens.to(torch.int64) + (alignment - 1)) // alignment * alignment
     return torch.sum(ent).item()
-
-
-_MOE_PAD_LOGGED: set = set()
-
-
-def _note_moe_padding(
-    M: int,
-    num_topk: int,
-    local_num_experts: int,
-    alignment_in: int,
-    alignment_used: int,
-    M_sum: int,
-    expert_tokens_meta,
-) -> None:
-    """一次性打印 MoE grouped GEMM 的对齐 padding 三要素。
-
-    目的：把「每 expert 2.1 MB padding」这个从 ncu 反推出来的结论，换成在真实
-    服务里直接量到的 (M, alignment_used, M_sum, 实际活跃专家数 A)。只在**未被
-    CUDA graph 捕获**时打印（捕获期不允许 GPU→CPU 同步），且每组分只打一次。
-    用 ``VLLM_MOE_PAD_LOG=1`` 打开。
-    """
-    import vllm.envs as _envs
-
-    if not _envs.VLLM_MOE_PAD_LOG:
-        return
-    capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-    key = (M, num_topk, local_num_experts, alignment_used, M_sum, capturing)
-    if key in _MOE_PAD_LOGGED:
-        return
-    _MOE_PAD_LOGGED.add(key)
-
-    a_str = "n/a(捕获期不做同步)"
-    useful = M * num_topk
-    if not capturing and expert_tokens_meta is not None:
-        ent = getattr(expert_tokens_meta, "expert_num_tokens", None)
-        if ent is not None:
-            try:
-                a = int((ent > 0).sum().item())
-                exact = int(
-                    (
-                        (ent.to(torch.int64) + alignment_used - 1)
-                        // alignment_used
-                        * alignment_used
-                    )
-                    .sum()
-                    .item()
-                )
-                a_str = (
-                    f"A={a} 精确M_sum={exact} "
-                    f"(useful={useful}, 上界={M_sum}, "
-                    f"padding={100 * (1 - useful / max(exact, 1)):.1f}%)"
-                )
-            except Exception as exc:  # noqa: BLE001
-                a_str = f"读取失败 {type(exc).__name__}"
-    print(
-        f"[moe-pad] M={M} topk={num_topk} experts={local_num_experts} "
-        f"align {alignment_in}->{alignment_used} M_sum={M_sum} useful={useful} "
-        f"| {a_str} | capturing={capturing}",
-        flush=True,
-    )
 
 
 def compute_aligned_M_and_alignment(
@@ -109,7 +50,7 @@ def compute_aligned_M_and_alignment(
         _msum = expert_num_tokens_round_up_and_sum(
             expert_tokens_meta.expert_num_tokens_cpu, alignment=alignment
         )
-        _note_moe_padding(
+        note_moe_padding(
             M,
             num_topk,
             local_num_experts,
@@ -147,7 +88,7 @@ def compute_aligned_M_and_alignment(
     max_active_experts = min(M * num_topk, local_num_experts)
     M_sum = (M * num_topk) + max_active_experts * (alignment - 1)
     M_sum = round_up(M_sum, alignment)
-    _note_moe_padding(
+    note_moe_padding(
         M,
         num_topk,
         local_num_experts,
@@ -533,63 +474,6 @@ def ep_gather(
     return
 
 
-_MOE_LAYOUT_LOGGED: set = set()
-
-
-def _note_moe_layout(
-    M: int,
-    num_topk: int,
-    local_num_experts: int,
-    align_used: int,
-    M_sum: int,
-    expert_num_tokens,
-    expert_start_loc,
-) -> None:
-    """一次性打印 MoE 真实布局：活跃专家数 A、每个专家的槽位大小、padding 占比。
-
-    这是把「每 expert 2.1 MB padding」从 ncu 反推换成直接读布局的一步：
-    ``expert_start_loc`` 的差分就是每个专家实际占用的行数（= 对齐后的槽位），
-    ``expert_num_tokens`` 是真 token 数，两者之差就是 padding。只在**未被 CUDA
-    graph 捕获**时读回（捕获期不允许同步）。用 ``VLLM_MOE_PAD_LOG=1`` 打开。
-    """
-    import vllm.envs as _envs
-
-    if not _envs.VLLM_MOE_PAD_LOG:
-        return
-    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-        return
-    key = (M, num_topk, align_used)
-    if key in _MOE_LAYOUT_LOGGED:
-        return
-    try:
-        ent = expert_num_tokens.to(torch.int64).cpu()
-        loc = expert_start_loc.to(torch.int64).cpu()
-        active = int((ent > 0).sum())
-        # expert_start_loc 有 N 项，差分只有 N-1 项：槽位 i 属于专家 i
-        slots = (loc[1:] - loc[:-1])[ent[:-1] > 0]
-        useful = int(ent.sum())
-        used_rows = int(slots.sum())
-        # 去重键含 A：启动期 dummy run 的路由是造出来的（A 很小），真实 decode 的
-        # 路由不同，必须两边都记下来才能对比。
-        key2 = (M, num_topk, active, used_rows)
-        if key2 in _MOE_LAYOUT_LOGGED:
-            return
-        _MOE_LAYOUT_LOGGED.add(key2)
-        _MOE_LAYOUT_LOGGED.add(key)
-        print(
-            f"[moe-layout] M={M} topk={num_topk} experts={local_num_experts} "
-            f"align_used={align_used} M_sum={M_sum} | A={active} "
-            f"useful_rows={useful} 实际占用槽位={used_rows} "
-            f"槽位/专家 min={int(slots.min()) if slots.numel() else 0} "
-            f"max={int(slots.max()) if slots.numel() else 0} "
-            f"| padding={100 * (1 - useful / max(used_rows, 1)):.1f}% "
-            f"| 槽位合计/M_sum={used_rows / max(M_sum, 1):.3f}",
-            flush=True,
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(f"[moe-layout] 读取失败 {type(exc).__name__}: {exc}", flush=True)
-
-
 def deepgemm_moe_permute(
     aq: torch.Tensor,
     aq_scale: torch.Tensor,
@@ -682,7 +566,7 @@ def deepgemm_moe_permute(
         pack_ue8m0=pack_ue8m0,
     )
 
-    _note_moe_layout(
+    note_moe_layout(
         M=topk_ids.size(0),
         num_topk=topk_ids.size(1),
         local_num_experts=local_num_experts,

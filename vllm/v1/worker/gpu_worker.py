@@ -60,6 +60,7 @@ from vllm.lora.request import LoRARequest
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.multimodal.gpu_ipc_memory import reserve_mm_ipc_gpu_memory
 from vllm.platforms import current_platform
+from vllm.profiler.memory import log_memory_breakdown
 from vllm.profiler.wrapper import (
     CudaProfilerWrapper,
     ProtonProfilerWrapper,
@@ -647,59 +648,14 @@ class Worker(WorkerBase):
             format_gib(self.available_kv_cache_memory_bytes),
         )
 
-        # --- VLLM_MEM_LOG: per-rank breakdown of the non-KV footprint ---
-        if envs.VLLM_MEM_LOG:
-            try:
-                import collections
-
-                def _grp(name: str) -> str:
-                    if "engram" in name:
-                        return "engram (host tables?)"
-                    if "experts" in name:
-                        return "MoE experts"
-                    if "shared_experts" in name:
-                        return "shared expert"
-                    if ".attn." in name or "compressor" in name or "indexer" in name:
-                        return "attention/compressor/indexer"
-                    if "mtp." in name:
-                        return "MTP/DSpark"
-                    if "embed" in name:
-                        return "embedding"
-                    if "head" in name:
-                        return "lm_head"
-                    if "vision" in name or "aligner" in name:
-                        return "vision/aligner"
-                    return "other"
-
-                model = self.model_runner.get_model()
-                dev, host = collections.Counter(), collections.Counter()
-                for name, p in model.named_parameters():
-                    (dev if p.device.type == "cuda" else host)[_grp(name)] += p.nbytes
-                alloc = torch.cuda.memory_allocated(self.device)
-                resv = torch.cuda.memory_reserved(self.device)
-                free_b, total_b = torch.cuda.mem_get_info(self.device)
-                logger.info(
-                    "MEMLOG param_cuda=%.2f param_host=%.2f torch_alloc=%.2f "
-                    "torch_reserved=%.2f non_torch=%.2f consumed(w+non_torch)=%.2f "
-                    "peak_act=%.2f cudagraph=%.2f | total=%.2f free=%.2f",
-                    sum(dev.values()) / 2**30,
-                    sum(host.values()) / 2**30,
-                    alloc / 2**30,
-                    resv / 2**30,
-                    (total_b - free_b - resv) / 2**30,
-                    self.total_consumed / 2**30,
-                    self.peak_activation_memory / 2**30,
-                    self.cudagraph_memory_estimate / 2**30,
-                    total_b / 2**30,
-                    free_b / 2**30,
-                )
-                for g, b in dev.most_common():
-                    logger.info("MEMLOG dev  %-30s %8.2f GiB", g, b / 2**30)
-                for g, b in host.most_common():
-                    logger.info("MEMLOG host %-30s %8.2f GiB", g, b / 2**30)
-            except Exception as exc:  # noqa: BLE001
-                logger.info("MEMLOG failed: %r", exc)
-        # --- END VLLM_MEM_LOG ---
+        # VLLM_MEM_LOG: per-rank breakdown of the non-KV footprint.
+        log_memory_breakdown(
+            self.model_runner.get_model(),
+            self.device,
+            consumed=self.total_consumed,
+            peak_activation=self.peak_activation_memory,
+            cudagraph=self.cudagraph_memory_estimate,
+        )
 
         if cudagraph_memory_estimate > 0:
             total_mem = self.init_snapshot.total_memory

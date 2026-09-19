@@ -100,7 +100,7 @@ def finish_capture(graph: Any, rank: int | None = None) -> None:
     """Remap the captured graph's annotations and persist them.
 
     Call once per captured graph, after the capture context exits. The pickle
-    lands in ``VLLM_GRAPH_KERNEL_ANNOTATION_DIR`` (or the working directory) as
+    lands in ``VLLM_PROFILE_DIR`` (or the working directory) as
     ``kernel_annotations_rank{rank}_{ts}.pkl``, which is what
     ``torch.cuda._annotate_cuda_graph_trace`` expects.
     """
@@ -119,7 +119,7 @@ def finish_capture(graph: Any, rank: int | None = None) -> None:
         logger.info(
             "CUDA graph kernel annotations: %d nodes on rank %d", len(annotations), rank
         )
-        directory = envs.VLLM_GRAPH_KERNEL_ANNOTATION_DIR or os.getcwd()
+        directory = envs.VLLM_PROFILE_DIR or os.getcwd()
         os.makedirs(directory, exist_ok=True)
         path = os.path.join(
             directory, f"kernel_annotations_rank{rank}_{int(time.time() * 1000)}.pkl"

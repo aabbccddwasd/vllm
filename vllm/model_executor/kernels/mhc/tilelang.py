@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
-from vllm.profiler.gemm_shapes import note_gemm
+from vllm.profiler.instrumentation import note_gemm
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
 

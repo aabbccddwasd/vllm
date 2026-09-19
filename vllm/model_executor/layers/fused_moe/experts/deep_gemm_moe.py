@@ -37,8 +37,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp8Static,
 )
 from vllm.platforms import current_platform
-from vllm.profiler.gemm_shapes import note_gemm
 from vllm.profiler.graph_annotations import graph_kernel_scope
+from vllm.profiler.instrumentation import note_gemm
 from vllm.utils.deep_gemm import (
     DeepGemmQuantScaleFMT,
     get_mk_alignment_for_contiguous_layout,

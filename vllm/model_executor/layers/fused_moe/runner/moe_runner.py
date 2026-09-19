@@ -46,8 +46,8 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExpertsOrder,
 )
 from vllm.platforms import current_platform
-from vllm.profiler.gemm_shapes import note_gemm
 from vllm.profiler.graph_annotations import graph_kernel_scope
+from vllm.profiler.instrumentation import note_gemm
 from vllm.utils.torch_utils import (
     _USE_LAYERNAME,
     LayerName,

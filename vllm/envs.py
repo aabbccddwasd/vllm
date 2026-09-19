@@ -259,24 +259,30 @@ if TYPE_CHECKING:
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB: int | None = None
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
+    # Opt-in profiling switches; see vllm/profiler/instrumentation.py. Each one
+    # only records what the engine did, never changes what it does, and is inert
+    # unless set. VLLM_PROFILE_DIR collects the records as files, so that a
+    # multi-rank run sharing a working directory can be read back per rank.
+    VLLM_PROFILE_DIR: str = ""
     # Name the CUDA graph nodes a model component creates, so a trace of a graph
     # *replay* can still be split per component. Needs a driver with
     # cudaGraphNodeGetToolsId; inert (no-op) when unavailable.
     VLLM_GRAPH_KERNEL_ANNOTATIONS: bool = False
-    VLLM_GRAPH_KERNEL_ANNOTATION_DIR: str = ""
-    # Log every GEMM call site's (M, N, K) once, to drive kernel microbenchmarks
-    # with the shapes the server really uses.
+    # Record every GEMM call site's (M, N, K) once, to drive kernel
+    # microbenchmarks with the shapes the server really uses.
     VLLM_GEMM_SHAPE_LOG: bool = False
-    VLLM_GEMM_SHAPE_LOG_PATH: str = ""
-    # Log every collective's (group, shape, dtype) once, to size comm budgets.
+    # Record every collective's (group, shape, dtype) once, to size comm budgets.
     VLLM_COMM_SHAPE_LOG: bool = False
-    # Log the MoE grouped layout's padding (rows the grouped GEMM reads but no
+    # Record the MoE grouped layout's padding (rows the grouped GEMM reads but no
     # token occupies) once, to size the padding the kernels are paying for.
     VLLM_MOE_PAD_LOG: bool = False
-    # Log the per-rank non-KV footprint once at startup -- parameters by group,
-    # torch allocation and non-torch memory -- to attribute what the KV cache
-    # budget is actually spent on.
+    # Record the per-rank non-KV footprint once at startup -- parameters by
+    # group, torch allocation and non-torch memory -- to attribute what the KV
+    # cache budget is actually spent on.
     VLLM_MEM_LOG: bool = False
+    # Record the KV cache accounting, group by group, at the point the budget is
+    # decided.
+    VLLM_KV_ACCOUNTING_LOG: bool = False
     # MXFP8 kernel policy. "" keeps upstream selection; "auto" picks the fastest
     # bit-exact backend per shape; "b12x_tuned" forces the tuned family-12 kernel.
     VLLM_MXFP8_BACKEND_POLICY: str = ""
@@ -1857,19 +1863,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_CUDAGRAPH_GC": lambda: bool(
         int(os.getenv("VLLM_ENABLE_CUDAGRAPH_GC", "0"))
     ),
-    # Profiling aids. All of them are inert unless explicitly enabled: the
-    # annotation scopes and the shape log only record, never change a decision.
+    # Profiling aids, owned by vllm/profiler/. All of them are inert unless
+    # explicitly enabled: they only record, never change a decision.
+    "VLLM_PROFILE_DIR": lambda: os.getenv("VLLM_PROFILE_DIR", ""),
     "VLLM_GRAPH_KERNEL_ANNOTATIONS": lambda: bool(
         int(os.getenv("VLLM_GRAPH_KERNEL_ANNOTATIONS", "0"))
     ),
-    "VLLM_GRAPH_KERNEL_ANNOTATION_DIR": lambda: os.getenv(
-        "VLLM_GRAPH_KERNEL_ANNOTATION_DIR", ""
-    ),
     "VLLM_GEMM_SHAPE_LOG": lambda: bool(int(os.getenv("VLLM_GEMM_SHAPE_LOG", "0"))),
-    "VLLM_GEMM_SHAPE_LOG_PATH": lambda: os.getenv("VLLM_GEMM_SHAPE_LOG_PATH", ""),
     "VLLM_COMM_SHAPE_LOG": lambda: bool(int(os.getenv("VLLM_COMM_SHAPE_LOG", "0"))),
     "VLLM_MOE_PAD_LOG": lambda: bool(int(os.getenv("VLLM_MOE_PAD_LOG", "0"))),
     "VLLM_MEM_LOG": lambda: bool(int(os.getenv("VLLM_MEM_LOG", "0"))),
+    "VLLM_KV_ACCOUNTING_LOG": lambda: bool(
+        int(os.getenv("VLLM_KV_ACCOUNTING_LOG", "0"))
+    ),
     "VLLM_MXFP8_BACKEND_POLICY": lambda: os.getenv("VLLM_MXFP8_BACKEND_POLICY", ""),
     # Used to force set up loopback IP
     "VLLM_LOOPBACK_IP": lambda: os.getenv("VLLM_LOOPBACK_IP", ""),

@@ -59,7 +59,7 @@ from vllm.model_executor.layers.fusion.quant_activation import (
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     mxfp8_e4m3_quantize,
 )
-from vllm.profiler.gemm_shapes import note_gemm
+from vllm.profiler.instrumentation import note_gemm
 
 from .flashinfer import FlashInferCutlassMxfp8LinearKernel
 

@@ -2459,13 +2459,37 @@ def _max_memory_usage_bytes_from_groups(
     for group in kv_cache_groups:
         spec = group.kv_cache_spec
         if isinstance(spec, UniformTypeKVCacheSpecs):
-            total_blocks += spec.max_memory_usage_pages(vllm_config)
+            pages = spec.max_memory_usage_pages(vllm_config)
         else:
-            total_blocks += cdiv(
+            pages = cdiv(
                 spec.max_memory_usage_bytes(vllm_config),
                 spec.page_size_bytes,
             )
+        total_blocks += pages
+        if envs.VLLM_KV_ACCOUNTING_LOG:
+            logger.info(
+                "KV-ACCT grp=%-22s layers=%-3d uniform=%-5s block=%s page=%s "
+                "per_layer_bytes=%s pages=%d",
+                type(spec).__name__,
+                len(group.layer_names),
+                isinstance(spec, UniformTypeKVCacheSpecs),
+                getattr(spec, "block_size", None),
+                spec.page_size_bytes,
+                spec.max_memory_usage_bytes(vllm_config)
+                // max(1, len(group.layer_names)),
+                pages,
+            )
 
+    if envs.VLLM_KV_ACCOUNTING_LOG:
+        logger.info(
+            "KV-ACCT TOTAL max_model_len=%d max_in_flight=%d bytes_per_block=%d "
+            "total_blocks=%d needed=%.4f GiB  (widest-group page x sum(pages))",
+            vllm_config.model_config.max_model_len,
+            vllm_config.max_in_flight_tokens,
+            bytes_per_block,
+            total_blocks,
+            bytes_per_block * total_blocks / 1024**3,
+        )
     return bytes_per_block * total_blocks
 
 
