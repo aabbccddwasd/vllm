@@ -54,6 +54,7 @@ from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v41.compressor import DeepseekCompressor
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
@@ -122,6 +123,27 @@ def _fill_short_context_topk_indices(
 # plus 7 UE8M0 scales of 64 dims and a pad byte (584 B, 576 B pages).
 def _use_v41_mxfp8_kv_record() -> bool:
     return current_platform.is_device_capability_family(100)
+
+
+def _sm12x_sparse_page_tokens(compress_ratio: int) -> int:
+    """Cache block size that hands the SM12x sparse-MLA kernels a 64-state page.
+
+    Those kernels read ``num_states = block_size // tokens_per_state``, and only
+    the 64-entry page is instantiated for family 12. Sizing the block by the
+    compression ratio keeps every ratio on that page instead of splitting the
+    manager block.
+    """
+    return max(PAGED_MQA_PAGE_SIZES) * max(1, compress_ratio)
+
+
+def _swa_cache_block_size() -> int:
+    """Page size for the V4.1 sliding-window cache.
+
+    The SWA pool doubles as the sparse-MLA kernel's primary packed cache, and
+    FlashInfer's SM120 sparse-MLA decode only ships 64-token pages; the other
+    sparse decode paths accept the 32-token page.
+    """
+    return 64 if current_platform.is_device_capability_family(120) else 32
 
 
 def _resolve_dsv4_kv_cache_dtype(
@@ -538,7 +560,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             prefix=f"{prefix}.swa_cache",
             cache_config=cache_config,
             backend_cls=self.swa_backend_cls,
-            block_size=32,
+            block_size=_swa_cache_block_size(),
             packed_bytes_per_token=self.swa_bytes_per_token,
             packed_page_alignment=self.kv_page_alignment,
             bounded_replay=swa_bounded_replay,
@@ -1060,8 +1082,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # to the decode kernel's TMA stride; plain bf16 / per-tensor fp8 rows
         # use natural element-size pages.
         uses_fp8_ds_mla_layout = self.kv_cache_dtype in ("fp8_ds_mla", "nvfp4_ds_mla")
+        # The SM12x sparse-MLA prefill kernel is handed the compressed pool's
+        # page as `num_states` and only serves the 64-state page, so size this
+        # cache's block by the compression ratio there.
+        block_size = vllm_config.cache_config.block_size
+        if current_platform.is_device_capability_family(120):
+            block_size = _sm12x_sparse_page_tokens(self.compress_ratio)
         return MLAAttentionSpec(
-            block_size=vllm_config.cache_config.block_size,
+            block_size=block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,
@@ -1126,8 +1154,14 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         page_alignment = (
             576 if uses_fp8_ds_mla_layout and not _use_v41_mxfp8_kv_record() else 512
         )
+        # DeepGEMM's paged-MQA logits kernel is handed `num_states` as its
+        # `block_kv`, and family 12 only ships the 64-state page; sizing the
+        # block by the compression ratio keeps every ratio on that page.
+        block_size = self.cache_config.block_size
+        if current_platform.is_device_capability_family(120):
+            block_size = _sm12x_sparse_page_tokens(self.compress_ratio)
         return MLAAttentionSpec(
-            block_size=self.cache_config.block_size,
+            block_size=block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,

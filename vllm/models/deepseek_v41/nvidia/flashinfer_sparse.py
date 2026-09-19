@@ -24,7 +24,9 @@ from vllm.models.deepseek_v41.sparse_mla import (
     DeepseekV4SparseMLAMetadataBuilder,
     DeepseekV41SparseSWAMetadataBuilder,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
+from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
@@ -114,6 +116,11 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        if current_platform.is_device_capability_family(120):
+            # V4.1 sizes each compressed cache block to `64 * compress_ratio` on
+            # this family, so the kernel always sees a 64-state page; accept
+            # every such size so no manager block has to be split.
+            return [max(PAGED_MQA_PAGE_SIZES) * ratio for ratio in (1, 2)]
         return [128]
 
     @staticmethod

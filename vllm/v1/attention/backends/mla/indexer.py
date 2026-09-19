@@ -21,6 +21,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
+    PAGED_MQA_PAGE_SIZES,
     get_paged_mqa_logits_metadata,
     has_deep_gemm,
     native_next_n_supported,
@@ -260,7 +261,17 @@ class DeepseekV41IndexerBackend(DeepseekV4IndexerBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [64 if current_platform.is_device_capability_family(90) else 128]
+        if current_platform.is_device_capability_family(90):
+            return [64]
+        if current_platform.is_device_capability_family(120):
+            # Family 12 ships the fp8 paged-MQA logits kernel for a 64-state
+            # page only, and `block_kv` is this cache's `num_states`
+            # (= block_size // tokens_per_state). V4.1 owns one cache per
+            # compression ratio and sizes each block to `64 * ratio`, so accept
+            # every such size; no other size divides both the manager block and
+            # the kernel page.
+            return [max(PAGED_MQA_PAGE_SIZES) * ratio for ratio in (1, 2)]
+        return [128]
 
 
 @dataclass(frozen=True)
