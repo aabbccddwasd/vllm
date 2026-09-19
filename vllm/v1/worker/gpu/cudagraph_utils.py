@@ -34,6 +34,7 @@ from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
+from vllm.utils.multi_stream_utils import vllm_cudagraph_capture_scope
 from vllm.utils.torch_utils import current_stream
 from vllm.v1.hisparse.binding import release_hisparse_profiling_cache
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -411,7 +412,15 @@ class CudaGraphManager:
             progress_bar_desc: Description shown on the capture progress bar.
 
         """
-        with graph_capture(device=self.device), ExitStack() as stack:
+        # Keep event handles created by descriptor warmups alive together with
+        # the graph artifacts captured below. Some multi-stream custom ops run
+        # on joined auxiliary streams where CUDA's per-current-stream capture
+        # query is false even though later graph nodes retain those handles.
+        with (
+            graph_capture(device=self.device),
+            vllm_cudagraph_capture_scope(),
+            ExitStack() as stack,
+        ):
             if self.ubatch_runner is not None:
                 # Join parked threads on failure to avoid blocking later captures.
                 stack.callback(self.ubatch_runner.abort_pending_run)
@@ -471,8 +480,11 @@ class CudaGraphManager:
                         if self._capture_mem_samples is not None:
                             torch.accelerator.synchronize()
                             free_before = torch.accelerator.get_memory_info()[0]
-                        with torch.cuda.graph(
-                            graph, self.pool, stream=self._capture_stream(desc)
+                        with (
+                            vllm_cudagraph_capture_scope(),
+                            torch.cuda.graph(
+                                graph, self.pool, stream=self._capture_stream(desc)
+                            ),
                         ):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid

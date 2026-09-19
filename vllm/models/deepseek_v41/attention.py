@@ -5,6 +5,7 @@
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from contextlib import nullcontext
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -56,6 +57,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
 from vllm.utils.multi_stream_utils import (
+    CUDAGraphCaptureEventPool,
     execute_in_parallel,
     maybe_execute_in_parallel,
 )
@@ -280,6 +282,26 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     def _uses_fp8_ds_mla_layout(self) -> bool:
         """Return whether this instance stores fp8 KV in fp8_ds_mla layout."""
         return self.use_fp8_ds_mla_layout
+
+    def _post_gemm_event_lease(self):
+        """Lease the post-GEMM overlap's event handles.
+
+        With a pool present this returns capture-private handles (and a fresh
+        set per eager call), so the cache/indexer overlap can never inherit a
+        generation recorded by another graph or by the earlier GEMM join.
+        """
+        pool = getattr(self, "attn_event_pool", None)
+        # attention_impl can execute eagerly between CUDA graph segments. Its
+        # event handles must not be recycled into another graph artifact.
+        if pool is None:
+            # Resolve the fallback lazily: a default in getattr(...) would be
+            # evaluated eagerly and dereference an attribute the layer may not
+            # have (object.__new__ in tests, layering changes).
+            events = getattr(self, "attn_events", None)
+            if events is None:
+                events = self.ln_events[:2]
+            return nullcontext(events)
+        return pool.lease(private_eager=True)
 
     def __init__(
         self,
@@ -512,6 +534,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # [1] doubles as post-GEMM event1. Reuse is safe: GEMM fully joins
         # before post-GEMM starts.
         self.ln_events = [torch.cuda.Event() for _ in range(4)]
+        # post-GEMM overlap runs its own event generation, kept strictly
+        # separate from ln_events. The input-GEMM join only enqueues waits on
+        # the default stream; re-recording the same handles for the cache /
+        # indexer overlap before those waits execute can race. The pool also
+        # keeps every captured graph on private handles, since a handle shared
+        # across graphs replays a stale generation.
+        self.attn_event_pool = CUDAGraphCaptureEventPool(2)
+        self.attn_events = self.attn_event_pool.default_events
 
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
         # ---- Attention / KV-cache setup ----
@@ -814,14 +844,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         if compressor is not None:
             # Q projection / KV insertion on the default stream overlaps the
-            # compressor on aux stream 0 (sequential on ROCm).
-            q, latent = maybe_execute_in_parallel(
-                project_query_and_cache_kv,
-                lambda: compressor(kv_score, positions),
-                self.ln_events[0],
-                self.ln_events[1],
-                aux_stream,
-            )
+            # compressor on aux stream 0 (sequential on ROCm). The post-GEMM
+            # overlap leases its own event generation, distinct from the input
+            # GEMM's ln_events.
+            with self._post_gemm_event_lease() as attn_events:
+                q, latent = maybe_execute_in_parallel(
+                    project_query_and_cache_kv,
+                    lambda: compressor(kv_score, positions),
+                    attn_events[0],
+                    attn_events[1],
+                    aux_stream,
+                )
         else:
             q = project_query_and_cache_kv()
 
@@ -838,13 +871,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             )
 
         if compressor is not None:
-            indexer_result, _ = maybe_execute_in_parallel(
-                prepare_indexer,
-                lambda: compressor.insert_cache(latent, positions, self.rotary_emb),
-                self.ln_events[0],
-                self.ln_events[1],
-                aux_stream,
-            )
+            with self._post_gemm_event_lease() as attn_events:
+                indexer_result, _ = maybe_execute_in_parallel(
+                    prepare_indexer,
+                    lambda: compressor.insert_cache(latent, positions, self.rotary_emb),
+                    attn_events[0],
+                    attn_events[1],
+                    aux_stream,
+                )
         else:
             indexer_result = prepare_indexer()
         index_q, index_q_scale, index_weights_out = indexer_result

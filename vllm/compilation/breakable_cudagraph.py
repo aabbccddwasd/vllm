@@ -45,6 +45,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
+from vllm.utils.multi_stream_utils import vllm_cudagraph_capture_scope
 from vllm.utils.torch_utils import weak_ref_tensor, weak_ref_tensors
 
 logger = init_logger(__name__)
@@ -386,7 +387,10 @@ class BreakableCUDAGraphWrapper:
         get_offloader().sync_prev_onload()
 
         capture = BreakableCUDAGraphCapture(pool=self.graph_pool)
-        with capture:
+        # The capture scope marks this Python execution as a graph capture even
+        # on joined auxiliary streams, where CUDA's per-current-stream capture
+        # query is false while later graph nodes still retain those handles.
+        with vllm_cudagraph_capture_scope(), capture:
             output = self.runnable(*args, **kwargs)
             # Join the offloader's copy stream while we still hold the last
             # segment open, so the join is captured into the graph (otherwise
