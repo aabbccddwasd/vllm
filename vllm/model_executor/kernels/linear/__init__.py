@@ -108,6 +108,9 @@ from vllm.model_executor.kernels.linear.mxfp8 import (
 from vllm.model_executor.kernels.linear.mxfp8.b12x import (
     B12xMxfp8LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mxfp8.b12x_tuned import (
+    B12xTunedMxfp8LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mxfp8.deep_gemm import (
     DeepGemmMxfp8BmmLinearKernel,
 )
@@ -530,6 +533,7 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
 # in priority/performance order (when available)
 _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
     PlatformEnum.CUDA: [
+        B12xTunedMxfp8LinearKernel,
         FlashInferCutedslMxfp8LinearKernel,
         FlashInferCutlassMxfp8LinearKernel,
         MarlinMxfp8LinearKernel,

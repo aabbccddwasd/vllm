@@ -4,6 +4,7 @@
 import torch
 from torch.nn.parameter import Parameter
 
+import vllm.envs as envs
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
     as_quantized_activation,
@@ -18,10 +19,50 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp8Dynamic,
 )
 from vllm.platforms import current_platform
+from vllm.profiler.gemm_shapes import note_gemm
 from vllm.utils import flashinfer as vllm_flashinfer
 from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutedsl
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
+
+# K -> backend that last worked, so a backend rejected for one shape does not
+# cost a try/except on every call (and never retries inside a graph capture).
+_MM_BACKEND_K: dict[int, str] = {}
+
+
+def _mm_backend(k: int) -> str:
+    """FlashInfer ``mm_mxfp8`` backend for a contraction dim of ``k``.
+
+    vLLM pins ``backend="cutlass"``, whose tile is 128(N) x 32(M) x 128(K). At
+    decode M is 6..24, so there is exactly one M tile and the grid collapses to
+    ``ceil(N/128)`` CTAs -- 9 of 188 SMs for N=1152 -- which is why the served
+    dense path only reaches ~500 GB/s (see DECODE-BUDGET.md 3.3). The other
+    FlashInfer backends carry schedules that fill the GPU on the same shapes and
+    are **bit-exact** against CUTLASS on them (max|abs| = 0 measured across all
+    six served shapes, ``tools/bench_mxfp8_backends.py``).
+
+    "auto" picks b12x where it applies (3.3x on 25600x6144) and cuDNN for the
+    K=576 shape b12x rejects. Opt in with ``VLLM_MXFP8_BACKEND_POLICY=auto``;
+    the default keeps upstream behaviour.
+    """
+    policy = envs.VLLM_MXFP8_BACKEND_POLICY
+    if policy in ("", "cutlass"):
+        return "cutlass"
+    cached = _MM_BACKEND_K.get(k)
+    if cached is not None:
+        return cached
+    if policy in ("auto", "b12x_tuned"):
+        # b12x_tuned routes the shapes it can handle to its own kernel and falls
+        # back here for the rest, so both policies resolve the same way.
+        #
+        # The fallback is CUTLASS, not cuDNN. Measured on the served step
+        # (evidence/prof-mxfp8auto vs prof-shapes): for K=576 -- the one served
+        # shape b12x rejects -- CUTLASS's secondary 128x64 tile does it in 43
+        # launches of 3.7 us (0.161 ms/step) while cuDNN needs 17.1 us per
+        # launch, i.e. 0.736 ms/step. Routing K=576 to cuDNN threw away most of
+        # what b12x gained on the other five shapes.
+        return "b12x" if k % 128 == 0 else "cutlass"
+    return policy
 
 
 class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
@@ -69,6 +110,16 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         weight = layer.weight
         weight_scale = layer.weight_scale
         N, K = weight.shape
+        backend = _mm_backend(K)
+        note_gemm(
+            "mxfp8.flashinfer_cutlass",
+            M=x.shape[0] if hasattr(x, "shape") else -1,
+            N=N,
+            K=K,
+            layer=type(layer).__name__,
+            prefix=getattr(layer, "prefix", ""),
+            backend=backend,
+        )
 
         min_dim = 128
 
@@ -101,14 +152,27 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         if not weight.is_contiguous():
             weight = weight.contiguous()
 
-        output = vllm_flashinfer.mm_mxfp8(
-            input_mxfp8,
-            weight.t(),
-            input_scale,
-            weight_scale,
-            out_dtype=out_dtype,
-            backend="cutlass",
-        )
+        try:
+            output = vllm_flashinfer.mm_mxfp8(
+                input_mxfp8,
+                weight.t(),
+                input_scale,
+                weight_scale,
+                out_dtype=out_dtype,
+                backend=backend,
+            )
+        except Exception:
+            if backend == "cutlass":
+                raise
+            _MM_BACKEND_K[K] = "cutlass"
+            output = vllm_flashinfer.mm_mxfp8(
+                input_mxfp8,
+                weight.t(),
+                input_scale,
+                weight_scale,
+                out_dtype=out_dtype,
+                backend="cutlass",
+            )
 
         if bias is not None:
             output = output + bias
