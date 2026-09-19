@@ -274,6 +274,10 @@ if TYPE_CHECKING:
     # Log the MoE grouped layout's padding (rows the grouped GEMM reads but no
     # token occupies) once, to size the padding the kernels are paying for.
     VLLM_MOE_PAD_LOG: bool = False
+    # Log the per-rank non-KV footprint once at startup -- parameters by group,
+    # torch allocation and non-torch memory -- to attribute what the KV cache
+    # budget is actually spent on.
+    VLLM_MEM_LOG: bool = False
     # MXFP8 kernel policy. "" keeps upstream selection; "auto" picks the fastest
     # bit-exact backend per shape; "b12x_tuned" forces the tuned family-12 kernel.
     VLLM_MXFP8_BACKEND_POLICY: str = ""
@@ -1931,6 +1935,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GEMM_SHAPE_LOG_PATH": lambda: os.getenv("VLLM_GEMM_SHAPE_LOG_PATH", ""),
     "VLLM_COMM_SHAPE_LOG": lambda: bool(int(os.getenv("VLLM_COMM_SHAPE_LOG", "0"))),
     "VLLM_MOE_PAD_LOG": lambda: bool(int(os.getenv("VLLM_MOE_PAD_LOG", "0"))),
+    "VLLM_MEM_LOG": lambda: bool(int(os.getenv("VLLM_MEM_LOG", "0"))),
     "VLLM_MXFP8_BACKEND_POLICY": lambda: os.getenv("VLLM_MXFP8_BACKEND_POLICY", ""),
     "VLLM_MXFP8_SPLIT_K": lambda: int(os.getenv("VLLM_MXFP8_SPLIT_K", "0")),
     "VLLM_O_PROJ_GROUPED_MM": lambda: bool(
