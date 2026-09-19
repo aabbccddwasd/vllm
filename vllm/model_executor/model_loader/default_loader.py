@@ -2,18 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import glob
-import itertools
 import os
 import time
 from collections.abc import Generator, Iterable
-from pathlib import PurePosixPath
 from typing import cast
 
 import torch
 from torch import nn
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
-from vllm import envs
 from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
@@ -36,7 +33,6 @@ from vllm.model_executor.model_loader.weight_utils import (
     np_cache_weights_iterator,
     pt_weights_iterator,
     safetensors_weights_iterator,
-    split_oversized_checkpoint_files,
 )
 from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import list_filtered_repo_files
@@ -274,38 +270,10 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config.use_tqdm_on_load,
                 )
             elif self.load_config.load_format == "instanttensor":
-                device_files, oversized_files = split_oversized_checkpoint_files(
-                    hf_weights_files
+                weights_iterator = instanttensor_weights_iterator(
+                    hf_weights_files,
+                    self.load_config.use_tqdm_on_load,
                 )
-                if not oversized_files:
-                    weights_iterator = instanttensor_weights_iterator(
-                        hf_weights_files,
-                        self.load_config.use_tqdm_on_load,
-                    )
-                else:
-                    logger.info(
-                        "InstantTensor handles %d checkpoint files; %d file(s) hold "
-                        "tensors larger than %d MiB and are read by the safetensors "
-                        "path instead: %s",
-                        len(device_files),
-                        len(oversized_files),
-                        envs.VLLM_DEVICE_LOADER_MAX_TENSOR_BYTES >> 20,
-                        [PurePosixPath(p).name for p in oversized_files],
-                    )
-                    weights_iterator = itertools.chain(
-                        instanttensor_weights_iterator(
-                            device_files,
-                            self.load_config.use_tqdm_on_load,
-                        )
-                        if device_files
-                        else iter(()),
-                        safetensors_weights_iterator(
-                            oversized_files,
-                            self.load_config.use_tqdm_on_load,
-                            self.load_config.safetensors_load_strategy,
-                            local_expert_ids=self.local_expert_ids,
-                        ),
-                    )
             else:
                 if extra_config.get("enable_multithread_load"):
                     weights_iterator = multi_thread_safetensors_weights_iterator(

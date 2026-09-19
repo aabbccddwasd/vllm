@@ -280,17 +280,6 @@ if TYPE_CHECKING:
     # MXFP8 kernel policy. "" keeps upstream selection; "auto" picks the fastest
     # bit-exact backend per shape; "b12x_tuned" forces the tuned family-12 kernel.
     VLLM_MXFP8_BACKEND_POLICY: str = ""
-    # Drop a shard from the page cache once its weights have been consumed. Only
-    # meaningful for checkpoints that do not fit in host memory alongside the
-    # process; off by default.
-    VLLM_SAFETENSORS_DROP_CACHE: bool = False
-    # Largest single tensor an InstantTensor (device-side) load may stage; files
-    # holding anything larger are read shard-by-shard by the safetensors path.
-    VLLM_DEVICE_LOADER_MAX_TENSOR_BYTES: int = 2 << 30
-    # InstantTensor backend name ("" = library default) and whether each tensor
-    # must be copied before the next is pulled.
-    VLLM_INSTANTTENSOR_BACKEND: str = ""
-    VLLM_INSTANTTENSOR_COPY: bool = True
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
@@ -1882,16 +1871,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MOE_PAD_LOG": lambda: bool(int(os.getenv("VLLM_MOE_PAD_LOG", "0"))),
     "VLLM_MEM_LOG": lambda: bool(int(os.getenv("VLLM_MEM_LOG", "0"))),
     "VLLM_MXFP8_BACKEND_POLICY": lambda: os.getenv("VLLM_MXFP8_BACKEND_POLICY", ""),
-    "VLLM_SAFETENSORS_DROP_CACHE": lambda: bool(
-        int(os.getenv("VLLM_SAFETENSORS_DROP_CACHE", "0"))
-    ),
-    "VLLM_DEVICE_LOADER_MAX_TENSOR_BYTES": lambda: int(
-        os.getenv("VLLM_DEVICE_LOADER_MAX_TENSOR_BYTES", str(2 << 30))
-    ),
-    "VLLM_INSTANTTENSOR_BACKEND": lambda: os.getenv("VLLM_INSTANTTENSOR_BACKEND", ""),
-    "VLLM_INSTANTTENSOR_COPY": lambda: bool(
-        int(os.getenv("VLLM_INSTANTTENSOR_COPY", "1"))
-    ),
     # Used to force set up loopback IP
     "VLLM_LOOPBACK_IP": lambda: os.getenv("VLLM_LOOPBACK_IP", ""),
     # Used to set the process name prefix for vLLM processes.

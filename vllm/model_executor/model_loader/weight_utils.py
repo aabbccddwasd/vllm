@@ -868,20 +868,6 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
-def _release_file_cache(path: str) -> None:
-    """Evict `path` from the page cache once its weights have been consumed."""
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
-
-
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -900,8 +886,6 @@ def safetensors_weights_iterator(
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
         loading_desc += " (eager)"
-
-    release_cache = envs.VLLM_SAFETENSORS_DROP_CACHE
 
     sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
 
@@ -1018,13 +1002,7 @@ def safetensors_weights_iterator(
                     if should_skip_weight(name, local_expert_ids):
                         continue
                     param = f.get_tensor(name)
-                    if release_cache:
-                        # Copy out of the mapping so the shard stops being
-                        # mapped once this file is done.
-                        param = param.clone()
                     yield name, param
-        if release_cache:
-            _release_file_cache(st_file)
 
 
 def multi_thread_safetensors_weights_iterator(
@@ -1163,72 +1141,6 @@ def fastsafetensors_weights_iterator(
             pl.close()
 
 
-def _largest_tensor_bytes(path: str) -> int:
-    """Largest single tensor in a safetensors file, from its header only."""
-    import json
-    import struct
-
-    sizes = {
-        "BOOL": 1,
-        "U8": 1,
-        "I8": 1,
-        "F8_E4M3": 1,
-        "F8_E5M2": 1,
-        "F8_E8M0": 1,
-        "I16": 2,
-        "U16": 2,
-        "F16": 2,
-        "BF16": 2,
-        "I32": 4,
-        "U32": 4,
-        "F32": 4,
-        "I64": 8,
-        "U64": 8,
-        "F64": 8,
-        "F8_E4M3FN": 1,
-        "F8_E4M3FNUZ": 1,
-    }
-    try:
-        with open(path, "rb") as fh:
-            header_len = struct.unpack("<Q", fh.read(8))[0]
-            header = json.loads(fh.read(header_len))
-    except (OSError, ValueError, struct.error):
-        return 0
-    largest = 0
-    for name, meta in header.items():
-        if name == "__metadata__" or not isinstance(meta, dict):
-            continue
-        nbytes = sizes.get(meta.get("dtype", ""), 0)
-        if not nbytes:
-            continue
-        for dim in meta.get("shape", []):
-            nbytes *= dim
-        largest = max(largest, nbytes)
-    return largest
-
-
-def split_oversized_checkpoint_files(
-    files: list[str], limit: int | None = None
-) -> tuple[list[str], list[str]]:
-    """Split files into (device-loadable, oversized) by largest tensor size.
-
-    A device-side loader must stage whole tensors, so its buffer has to cover
-    the largest one in the file set — the Engram tables are single 91.6 GiB
-    tensors, which no GPU can hold. Those files stay on the safetensors path,
-    whose per-file reader copies this rank's slice straight into the (pinned)
-    parameter, and yields identical bytes.
-    """
-    if limit is None:
-        limit = envs.VLLM_DEVICE_LOADER_MAX_TENSOR_BYTES
-    device_files: list[str] = []
-    oversized: list[str] = []
-    for path in files:
-        (oversized if _largest_tensor_bytes(path) > limit else device_files).append(
-            path
-        )
-    return device_files, oversized
-
-
 def instanttensor_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -1251,44 +1163,18 @@ def instanttensor_weights_iterator(
         # Entering here only in unit tests where the world group is not initialized.
         process_group = None
     else:
-        # InstantTensor's cross-rank coordination calls ncclCommUserRank() on the
-        # handle we hand it, which rejects vLLM's process group
-        # ("ncclCommUserRank(...) -> 4:invalid argument"), failing the whole load.
-        # Every rank reads the shards it needs anyway, so the local path is used.
-        process_group = None
-        _ = world_group
+        process_group = world_group.device_group if world_group.world_size > 1 else None
 
     device = current_platform.current_device()
 
-    # Backend choice is not cosmetic: the default (io_uring) registers the whole
-    # device buffer with the kernel and aborts the load with
-    # "io_uring_register_buffers failed: Cannot allocate memory" once the host is
-    # loaded with the pinned Engram tables (its thread then calls terminate()).
-    # cuFile moves the bytes straight from storage to HBM, which is also the
-    # fastest path measured here (8.5 vs 7.3 GiB/s).
-    backend_name = envs.VLLM_INSTANTTENSOR_BACKEND
-    backend = None
-    if backend_name:
-        try:
-            backend = getattr(instanttensor.Backend, backend_name)
-        except AttributeError as e:
-            raise ValueError(
-                f"unknown VLLM_INSTANTTENSOR_BACKEND={backend_name!r}; expected one "
-                f"of {[b.name for b in instanttensor.Backend]}"
-            ) from e
-
-    # copy=True hands out tensors that own their memory; copy=False hands out
-    # zero-copy views into the loader's ring buffer, which is what keeps the
-    # GPU-side staging from growing through torch's allocator. Either way the
-    # consumer must copy each tensor before pulling the next one, which is what
-    # AutoWeightsLoader does.
+    # copy=True yields tensors that own their memory, staying valid after the
+    # context exits or InstantTensor reuses its buffer.
     with instanttensor.safe_open(
         hf_weights_files,
         framework="pt",
         device=device,
         process_group=process_group,
-        copy=envs.VLLM_INSTANTTENSOR_COPY,
-        backend=backend,
+        copy=True,
     ) as f:
         # Track bytes so the bar reports load throughput (GB/s).
         pbar = tqdm(
