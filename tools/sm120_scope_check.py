@@ -57,6 +57,7 @@ CONSERVATIVE_DEFAULTS = {
     "VLLM_DSPARK_CONFIDENCE_WIDTH_PER_REQ": "0",
     "VLLM_DSPARK_CONFIDENCE_PROBE": "0",
     "VLLM_DSPARK_WIDTH_PATTERN": '""',
+    "VLLM_DSPARK_FORCE_REJECT": "0",
 }
 
 # Names the code reads off `vllm.envs` (directly or through an alias) but that

@@ -331,6 +331,11 @@ if TYPE_CHECKING:
     # Diagnostic: log the confidence head's per-position survival curve and the
     # widths it implies, to compare against the engine's measured acceptance.
     VLLM_DSPARK_CONFIDENCE_PROBE: bool = False
+    # Test-only: emit one token per step, exactly as a step that rejected every
+    # draft, while the verify still runs at full width. Throughput then equals
+    # step rate, so two backends can be compared at a fixed verified-row count
+    # with acceptance held out of the measurement.
+    VLLM_DSPARK_FORCE_REJECT: bool = False
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
@@ -1968,6 +1973,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_DSPARK_VERIFY_COST_MS", "0.592")
     ),
     "VLLM_DSPARK_WIDTH_PATTERN": lambda: os.getenv("VLLM_DSPARK_WIDTH_PATTERN", ""),
+    "VLLM_DSPARK_FORCE_REJECT": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_FORCE_REJECT", "0"))
+    ),
     "VLLM_DSPARK_CONFIDENCE_PROBE": lambda: bool(
         int(os.getenv("VLLM_DSPARK_CONFIDENCE_PROBE", "0"))
     ),
