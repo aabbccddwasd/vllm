@@ -394,6 +394,16 @@ class DeepseekV41ModelState(DefaultModelState):
         )
         trims = bool((keep < lens)[input_batch.is_prefilling_np[:num_reqs]].any())
         trims, counts = self._agree_across_dp(trims, int(keep.sum()))
+        if trims:
+            # Diagnostic for the local SM120 fork: makes it auditable that the
+            # replay layers really ran on a trimmed batch in this process.
+            logger.info_once(
+                "Decoder SWA bounded replay: trimming prefill rows to the "
+                "%d-token window (%d of %d batch rows kept).",
+                window,
+                int(keep.sum()),
+                int(lens.sum()),
+            )
         if cudagraph_mode == CUDAGraphMode.FULL:
             assert not trims
             return None
