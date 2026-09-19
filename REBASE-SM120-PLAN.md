@@ -9,6 +9,9 @@
 分支 `sm120/rebase-main`（自 `origin/main` a1bf8ac12d），**19 个提交 / 57 文件 / +4706 −204**。
 备份：tag `backup/pre-rebase-20260919` → `dc753a76fb`；未提交工作冻结在 `wip/pre-rebase-snapshot`（`fc1c473b7d`）。
 
+**后续（2026-09-19）**：系列落地后又加了 5 个清理提交（`df4a09bcf4` → `78fa50bfe6`），
+把新增的 36 个环境变量收敛到 8 个，详见 §12；备份 tag `backup/pre-cleanup-20260919`。
+
 | 阶段 | 提交 | 内容 |
 |---|---|---|
 | **S1** | `406b7f7a25` | family 12 页几何（`64 × ratio` 使 `num_states` 恒 64）+ backend 声明 + `max(1, ratio)` 守卫 |
@@ -208,14 +211,20 @@ origin/main (a1bf8ac12d)
 
 ### 5.5 `main` 已有 adaptive verification：本地 `verify_width.py` 的归属
 
+**结论（2026-09-19，已执行）**：实测**调度开销大于收窄 verify batch 的收益**，该路径不进生产，
+在 §12 的清理中整段删除（模块 + 测试 + 接线，备份 tag `backup/pre-cleanup-20260919` 保留）。
+以下是当时的判断依据。
+
 事实：`main` 的 `AdaptiveVerificationManager` 用实测 cost table + `argmax(tokens/cost)` 选 draft budget（host 侧 numpy，离散 budget）；本地 `v1/spec_decode/verify_width.py` 用 device 端不动点求解、**逐请求**宽度、无 host 同步，并配线上拟合的 `RowCostModel`。本地 dspark speculator 的注释指出：上游 adaptive 路径需要注意力后端能在 device 上裁剪 query 长度，**family 12 没有这样的后端**，所以本地那套是 sm120 的替代方案，不是重复实现。
 
-决策（待确认）：**不进 S1–S8 核心系列，单列为 S9（opt-in）**。理由：
+当时的决策（待确认）：**不进 S1–S8 核心系列，单列为 S9（opt-in）**。理由：
 1. 它是**未提交的 WIP**（342 行模块 + 452 行测试 + model_runner/speculator 接线），在本环境**无法验证**——效果必须用真实 DSv4.1-Flash（557 GB checkpoint，本地不存在）跑 acceptance/tok-s 才能判定；
 2. 与上游功能面重叠而"更优"未被证明，按 §0 的"简洁正确"与"重叠取最优（无证据则暂缓）"原则，不能让它进默认路径；
 3. 其小而有用的诊断部分（`VLLM_DSPARK_CONFIDENCE_HEAD` 与上游 gate 解耦、`_probe_confidence`）可以单独作为 opt-in 提交，代价小、无行为改变。
 
-若你希望现在就纳入，我按"默认关 + 独立提交 + 明确标注未验证"的方式落到 S9。
+覆盖该结论的证据：`DECODE-BUDGET.md` / `WIDTH-COST-MODEL.md` 的行宽扫描显示逐请求宽度带来的
+ragged verify batch 在调度侧的开销盖过了它省下的行；`serve_real.sh` 里那两个只为该测量存在的
+开关（`VLLM_DSPARK_FORCE_REJECT` / `VLLM_DSPARK_WIDTH_PATTERN`）也随之失效。
 
 ---
 
@@ -340,7 +349,6 @@ python3 tools/sm120_scope_check.py origin/main   -> passed
 pytest -q tests/v1/attention/test_deepseek_v41_block_size.py \
           tests/v1/attention/test_attention_splitting.py \
           tests/v1/attention/test_deepseek_v4_swa_visible.py \
-          tests/v1/spec_decode/test_verify_width.py \
           tests/v1/worker/test_utils.py \
           tests/test_multi_stream_utils.py \
           tests/models/deepseek_v4_1/ \
@@ -350,6 +358,30 @@ pytest -q tests/v1/attention/test_deepseek_v41_block_size.py \
 其中 `test_deepseek_v4_swa_visible.py::test_builder_in_image_visibility` 因**本机无 HF 网络**
 （`Network is unreachable`，失败点在 `tests/v1/attention/utils.py` 构造 `ModelConfig`）失败，与本次改动无关。
 
-**Tier 2（未做）**：真实 `DeepSeek-V4.1-Flash` e2e（557 GB checkpoint 不在本机）、
-`VLLM_ZERO_ALL_KV_AFTER_CAPTURE` 对照、tok/s 与 acceptance 测量。
+**Tier 2（未做）**：真实 `DeepSeek-V4.1-Flash` e2e（557 GB checkpoint 不在本机）、tok/s 与
+acceptance 测量。
+
+---
+
+## 12. 开关清理（2026-09-19，完成）
+
+系列落地后复查了它新增的 36 个环境变量，按「默认路径是否就是最优路径」分三类处理。
+备份 tag：`backup/pre-cleanup-20260919`。五个提交（`df4a09bcf4` → `78fa50bfe6`）：
+
+| 类别 | 处理 | 变量 |
+|---|---|---|
+| **开了只有好处**（同数学 / 逐比特验证过 / 无回退价值） | 删开关与旧分支，只留优路径 | `VLLM_MXFP4_MOE_COMPACT_W13`、`VLLM_O_PROJ_GROUPED_MM`、`VLLM_O_PROJ_DIRECT_WRITE`、`VLLM_ACT_QUANT_INDEXED`、`VLLM_IR_RMS_NORM_EAGER_FUSED`、`VLLM_MHC_PRE_MAX_SPLITS`(→64) |
+| **只为 A/B 固定选择存在** | 删开关，保留分支默认 | `VLLM_MXFP8_SPLIT_K`、`VLLM_ZERO_ALL_KV_AFTER_CAPTURE`、`VLLM_FORCE_VARLEN_DECODE_CAPTURE` |
+| **未被交付配方使用** | 连同被守卫的代码一起删 | DSpark 宽度求解器 7 个 + `VLLM_RAGGED_DEBUG`（实测调度开销大于收益，不进生产）；InstantTensor 加载器实验 4 个（`serve_real.sh` 记录阻塞 4 致命 + DROP_CACHE 实测否决） |
+| **真诊断** | 保留，规范化进 `vllm/profiler/` | `VLLM_GRAPH_KERNEL_ANNOTATIONS`、`VLLM_GEMM_SHAPE_LOG`、`VLLM_COMM_SHAPE_LOG`、`VLLM_MOE_PAD_LOG`、`VLLM_MEM_LOG`、`VLLM_KV_ACCOUNTING_LOG`(+`VLLM_PROFILE_DIR`) |
+| **真旋钮** | 保留 | `VLLM_MXFP8_BACKEND_POLICY` |
+
+结果：**36 → 8**，`tools/sm120_scope_check.py` 的 `CONSERVATIVE_DEFAULTS` 同步收敛到
+这 8 个；`model_loader/` 两个文件回到与上游逐字节一致，DSpark 宽度路径整体消失（约
+1400 行含测试）。
+
+诊断开关的规范形态见 `vllm/profiler/instrumentation.py`：一个开关注册表、一次
+「同一条观测只记一次」、一个产物目录 `VLLM_PROFILE_DIR`（4 rank 共工作目录时按
+`<kind>.log` 分文件）。原来两个只表示「产物放哪」的变量
+（`VLLM_GRAPH_KERNEL_ANNOTATION_DIR` / `VLLM_GEMM_SHAPE_LOG_PATH`）合并掉了。
 
