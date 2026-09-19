@@ -574,9 +574,7 @@ def main() -> int:
     parser.add_argument("--no-graph", action="store_true")
     parser.add_argument("--warm-l2", action="store_true")
     parser.add_argument("--iters", type=int, default=50)
-    parser.add_argument(
-        "--timer", default="event", choices=("event", "cupti", "both")
-    )
+    parser.add_argument("--timer", default="event", choices=("event", "cupti", "both"))
     parser.add_argument("--repeat-ms", type=int, default=200)
     parser.add_argument("--kernel-profile", action="store_true")
     parser.add_argument(
