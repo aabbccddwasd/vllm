@@ -78,6 +78,28 @@ class RMSNorm(CustomOp):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
         if residual is None:
+            if (
+                envs.VLLM_IR_RMS_NORM_EAGER_FUSED
+                and self.variance_size_override is None
+                and not torch.compiler.is_compiling()
+            ):
+                # Outside a compiled region `ir.ops.rms_norm` falls back to its
+                # torch reference: only the `native` provider is registered, and
+                # CUDA's default priority is ["native"] whenever Inductor is on
+                # (see `CudaPlatform.get_default_ir_op_priority`) because
+                # compiled regions get the op rewritten by the fusion passes.
+                # That fallback is 8 kernels (pow/mean/rsqrt/mul/cast/mul) where
+                # one suffices -- the tail head norm and the draft head norm both
+                # run here, never inside a compiled region. Keep the IR op on the
+                # compiling path so the fusion passes still see it.
+                out = torch.empty_like(x)
+                torch.ops._C.rms_norm(
+                    out,
+                    x,
+                    self.weight.data if self.pass_weight else None,
+                    self.variance_epsilon,
+                )
+                return out
             return ir.ops.rms_norm(
                 x,
                 self.weight.data if self.pass_weight else None,
