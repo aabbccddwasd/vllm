@@ -848,6 +848,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     suffixed = f"{head}.base_layer.{leaf}"
                     if suffixed in params_dict:
                         name = suffixed
+                if name not in params_dict:
+                    # Stacked weight whose target parameter is absent: a config
+                    # can disable the subsystem the checkpoint still ships (e.g.
+                    # `compress_ratios` zeroed so no compressor is built), and
+                    # there is nothing to load the tensor into.
+                    logger.debug_once(
+                        "Skipping stacked checkpoint weight with no parameter: %s",
+                        name,
+                    )
+                    break
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -909,6 +919,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         suffixed = f"{head}.base_layer.{leaf}"
                         if suffixed in params_dict:
                             name = suffixed
+                    if name not in params_dict:
+                        # A config can disable a subsystem whose weights the
+                        # checkpoint still carries (e.g. `engram_layer_ids=[]`
+                        # on a checkpoint with Engram tables). Those tensors have
+                        # no home in the model, so skip them instead of failing
+                        # the load -- which also keeps config edits usable as a
+                        # way to bisect runtime issues.
+                        logger.debug_once(
+                            "Skipping checkpoint weight with no parameter: %s", name
+                        )
+                        continue
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
