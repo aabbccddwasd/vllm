@@ -13,7 +13,6 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -541,33 +540,6 @@ class CudaGraphManager:
                     num_ubatches,
                 ):
                     return desc
-        if envs.VLLM_RAGGED_DEBUG and num_tokens > 0:
-            # Why a batch missed every captured graph. The ragged (per-request
-            # widths differ) case lives here: it can only match a varlen
-            # descriptor, so a missing/mismatching capture shows up as an
-            # empty or all-incompatible candidate list.
-            cands = self._candidates.get(key) or []
-            logger.info(
-                "CG_MISS mgr=%d captured=%s n_graphs=%d key=(tokens=%d,loras=%d) "
-                "live=(reqs=%d,tokens=%d,uniform=%s,max_q=%s,ubatches=%d) "
-                "n_candidates=%d candidates=%s captured_tokens=%s",
-                id(self),
-                self._graphs_captured,
-                len(self.graphs),
-                key[0],
-                key[1],
-                num_reqs,
-                num_tokens,
-                uniform_token_count,
-                max_query_len,
-                num_ubatches,
-                len(cands),
-                [
-                    (d.num_tokens, d.num_reqs, d.uniform_token_count, d.max_query_len)
-                    for d in cands[:4]
-                ],
-                sorted({d.num_tokens for d in self.graphs}),
-            )
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,
             num_tokens=num_tokens,

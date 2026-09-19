@@ -7,7 +7,6 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
-import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -286,13 +285,6 @@ class Scheduler(SchedulerInterface):
         self.prefix_replay_tokens = replay_windows.pop() if replay_windows else 0
         self.num_prefill_lookahead = vllm_config.num_prefill_lookahead_tokens
         self.dynamic_sd_lookup: list[int] | None = None
-        # Batch-wide width recommended by the worker's DSpark confidence head for
-        # the next step; takes precedence over the static batch-size schedule.
-        # ``None`` means "no recommendation" and keeps the configured width.
-        self._recommended_spec_tokens: int | None = None
-        # Per-request widths (req_id -> drafts to verify) from the same head, used
-        # to truncate each request's draft list. Empty means "no recommendation".
-        self._recommended_spec_tokens_per_req: dict[str, int] = {}
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
@@ -1453,12 +1445,6 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
-        if self._recommended_spec_tokens is not None:
-            # Confidence-driven width from the worker's previous step wins over
-            # the declared batch-size schedule.
-            num_spec_tokens_to_schedule = min(
-                self._recommended_spec_tokens, self.num_spec_tokens
-            )
 
         scheduled_encoder_input_stats = None
         if (
@@ -1939,15 +1925,6 @@ class Scheduler(SchedulerInterface):
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
         sampled_token_ids = model_runner_output.sampled_token_ids
-        recommended_spec_tokens = model_runner_output.recommended_spec_tokens
-        if recommended_spec_tokens is not None:
-            # Confidence-driven verify width for the next step (see schedule()).
-            self._recommended_spec_tokens = recommended_spec_tokens
-        per_req_widths = model_runner_output.recommended_spec_tokens_per_req
-        if per_req_widths is not None:
-            self._recommended_spec_tokens_per_req = dict(
-                zip(model_runner_output.req_ids, per_req_widths)
-            )
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
@@ -2518,27 +2495,9 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Add newly generated spec token ids to the request.
-            spec_token_ids = self.structured_output_manager.validate_tokens(
+            request.spec_token_ids = self.structured_output_manager.validate_tokens(
                 request, spec_token_ids
             )
-            width = self._recommended_spec_tokens_per_req.get(req_id)
-            if width is not None:
-                # Confidence-driven per-request width: drop the drafts this
-                # request is not going to verify, which makes the verification
-                # batch ragged. Everything downstream (scheduled token counts,
-                # query rows, logits rows) derives from this list, so the CPU and
-                # device views of the batch stay consistent.
-                n_before = len(spec_token_ids)
-                spec_token_ids = spec_token_ids[:width]
-                if envs.VLLM_RAGGED_DEBUG and n_before != len(spec_token_ids):
-                    logger.info(
-                        "WIDTH_APPLIED req=%s drafts %d -> %d (cap=%d)",
-                        req_id,
-                        n_before,
-                        len(spec_token_ids),
-                        width,
-                    )
-            request.spec_token_ids = spec_token_ids
 
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput

@@ -28,7 +28,6 @@ from typing import Any
 import numpy as np
 import torch
 
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
@@ -88,10 +87,6 @@ class DSparkSpeculator(DFlashSpeculator):
         )
 
         self.use_confidence_head: bool = False
-        self.draft_token_confidence_probs = torch.empty_like(
-            self.draft_tokens, dtype=torch.float32
-        )
-        self._confidence_probe_calls = 0
 
     def load_draft_model(
         self,
@@ -118,15 +113,6 @@ class DSparkSpeculator(DFlashSpeculator):
         self.use_confidence_head = (
             self.enable_adaptive_verification
             and model.model.confidence_head is not None
-        )
-        # The confidence head is the signal `enable_adaptive_verification`
-        # consumes, but the upstream gate couples the two: the head only runs
-        # inside the adaptive path, which needs an attention backend that trims
-        # query lengths on device -- family 12 has none. Let the head run on its
-        # own to inspect the predicted survival curve; nothing consumes its
-        # output, so this changes no decision.
-        self.enable_confidence_head = (
-            self.use_confidence_head or envs.VLLM_DSPARK_CONFIDENCE_HEAD
         )
         if self.use_confidence_head:
             # The acceptance estimator is not needed when a trained confidence head
@@ -252,7 +238,7 @@ class DSparkSpeculator(DFlashSpeculator):
         for i in range(n_spec):
             # Sequential stage: Markov bias from the previously sampled token.
             markov_embed = self.model.markov_embed(prev)
-            if self.enable_confidence_head:
+            if self.use_confidence_head:
                 confidence_markov_embeds.append(markov_embed)
             bias = self.model.markov_bias(markov_embed)
             logits_i = base_logits[:, i] + bias
@@ -262,7 +248,7 @@ class DSparkSpeculator(DFlashSpeculator):
             self.draft_tokens[:num_reqs, i] = draft_sampled_i
             prev = draft_sampled_i
 
-        if self.enable_confidence_head:
+        if self.use_confidence_head:
             confidence = self.model.compute_confidence(
                 sample_hidden,
                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
@@ -270,41 +256,6 @@ class DSparkSpeculator(DFlashSpeculator):
             self.draft_token_confidence_probs[:num_reqs] = confidence.view(
                 num_reqs, n_spec
             )
-            self._probe_confidence(num_reqs)
-
-    def _probe_confidence(self, num_reqs: int) -> None:
-        """Log the head's predicted acceptance per request (diagnostic; default off).
-
-        The head emits a per-position conditional acceptance probability, so the
-        per-request quantity comparable with the engine's measured acceptance
-        length is ``1 + sum_j prod_{i<=j} p_i``. Called from the *replay* path
-        (after the draft graph runs), never from the captured region: the head
-        itself lives inside the draft graph, so a read-back inserted inside it
-        would execute at capture time only.
-        """
-        if not envs.VLLM_DSPARK_CONFIDENCE_PROBE:
-            return
-        if torch.cuda.is_current_stream_capturing():
-            return
-        self._confidence_probe_calls += 1
-        if self._confidence_probe_calls % 5:
-            return
-        probs = self.draft_token_confidence_probs[:num_reqs].detach().float()
-        survival = torch.cumprod(probs, dim=1)
-        pred_len = 1.0 + survival.sum(dim=1)
-        # The stored tensor is the *post-sigmoid* probability in fp32, so the
-        # pre-sigmoid logits (what the reference tree temperature-scales) are
-        # recoverable by inversion. Logged for offline calibration fitting.
-        logits = torch.logit(probs.clamp_(1e-6, 1 - 1e-6))
-        logger.info(
-            "DSPARK_CONF_PROBE call=%d num_reqs=%d pred_acc_len=%s"
-            " surv_req0=%s logits_req0=%s",
-            self._confidence_probe_calls,
-            num_reqs,
-            [round(v, 3) for v in pred_len.tolist()],
-            [round(v, 3) for v in survival[0].tolist()],
-            [round(v, 2) for v in logits[0].tolist()],
-        )
 
     def _sample_sequential_topk(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
         """Apply the sequential Markov head only to top-k base-logit candidates.
@@ -332,7 +283,7 @@ class DSparkSpeculator(DFlashSpeculator):
 
         for i in range(n_spec):
             markov_embed = self.model.markov_embed(prev)
-            if self.enable_confidence_head:
+            if self.use_confidence_head:
                 confidence_markov_embeds.append(markov_embed)
             logits_i = self.model.apply_markov_bias_gathered(
                 markov_embed,
@@ -346,7 +297,7 @@ class DSparkSpeculator(DFlashSpeculator):
             self.draft_tokens[:num_reqs, i] = draft_sampled_i
             prev = draft_sampled_i
 
-        if self.enable_confidence_head:
+        if self.use_confidence_head:
             confidence = self.model.compute_confidence(
                 sample_hidden,
                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
@@ -354,7 +305,6 @@ class DSparkSpeculator(DFlashSpeculator):
             self.draft_token_confidence_probs[:num_reqs] = confidence.view(
                 num_reqs, n_spec
             )
-            self._probe_confidence(num_reqs)
 
     def _generate_draft(
         self,

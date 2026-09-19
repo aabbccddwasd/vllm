@@ -361,20 +361,6 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
-    # Batch-wide number of draft tokens to schedule next step, recommended by the
-    # worker's DSpark confidence head. ``None`` keeps the scheduler's configured
-    # width (static or the batch-size schedule). The worker computes this from the
-    # drafts it just proposed, so the decision never depends on tokens that have
-    # not been verified yet.
-    recommended_spec_tokens: int | None = None
-
-    # Per-request variant of the above, aligned with ``req_ids``: how many of the
-    # drafts this worker just proposed each request should actually verify next
-    # step. Truncating a request's draft list makes the verification batch ragged
-    # (per-request row counts differ), which is what the varlen decode graphs
-    # serve. ``None`` keeps every request at the batch-wide width.
-    recommended_spec_tokens_per_req: list[int] | None = None
-
     # Per-step routed experts data captured by the worker.
     # ``routing_data`` shape: (num_scheduled_tokens, num_layers,
     #                         num_experts_per_tok); expert IDs as uint8/uint16.

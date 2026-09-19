@@ -6,7 +6,6 @@ from typing import Any
 import numpy as np
 import torch
 
-import vllm.envs as envs
 from vllm.config import SpeculativeConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.triton_utils import tl, triton
@@ -311,14 +310,6 @@ class RejectionSampler:
             chunk_logit_limit,
             max_num_logprobs,
         )
-
-        if envs.VLLM_DSPARK_FORCE_REJECT:
-            # Measurement mode: emit one token per step, exactly as a step that
-            # rejected every draft, while the verify still runs at full width.
-            # `sampled[0]` is the target's own sample either way (an accepted
-            # draft is a target sample by construction), so the emitted token
-            # stays valid; `num_rejected` derives from `num_sampled` below.
-            num_sampled = torch.ones_like(num_sampled)
 
         num_sampled, num_rejected = get_num_sampled_and_rejected(
             num_sampled,

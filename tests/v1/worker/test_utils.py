@@ -1406,16 +1406,6 @@ def test_zero_captured_kv_caches_clears_only_block_zero():
     assert torch.equal(cache[1:], untouched)
 
 
-def test_zero_captured_kv_caches_full_clears_every_block():
-    """A capture whose dummy slot mappings reach real pages needs the whole
-    cache restored, not just the null block."""
-    cache = torch.full((4, 2, 3), float("nan"))
-
-    zero_captured_kv_caches([cache], full=True)
-
-    assert torch.all(cache == 0)
-
-
 def test_zero_captured_kv_caches_skips_empty_caches():
     """A layer may hold a placeholder with no blocks; indexing it would raise."""
     empty = torch.empty(0)

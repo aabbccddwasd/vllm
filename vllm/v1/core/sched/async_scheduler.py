@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -42,24 +41,7 @@ class AsyncScheduler(Scheduler):
             )
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
-            # The placeholder *length* is what the next step schedules, so a
-            # per-request confidence width is expressed by giving that request a
-            # shorter list: its batch-mates keep the batch-wide width and the
-            # verification batch becomes ragged, which the varlen decode graphs
-            # serve.
-            width = self._recommended_spec_tokens_per_req.get(req_id)
-            if width is None:
-                request.spec_token_ids = self._spec_token_placeholders
-            else:
-                width = max(0, min(width, len(self._spec_token_placeholders)))
-                request.spec_token_ids = self._spec_token_placeholders[:width]
-                if envs.VLLM_RAGGED_DEBUG:
-                    logger.info(
-                        "WIDTH_PLACEHOLDER req=%s width=%d batch_width=%d",
-                        req_id,
-                        width,
-                        len(self._spec_token_placeholders),
-                    )
+            request.spec_token_ids = self._spec_token_placeholders
 
             if self.use_v2_model_runner:
                 # Set the next step index in which this request is eligible to be
