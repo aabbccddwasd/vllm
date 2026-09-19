@@ -701,6 +701,31 @@ def make_kv_sharing_fast_prefill_common_attn_metadata(
     return common_attn_metadata
 
 
+def spec_decode_verify_query_len(num_speculative_tokens: int) -> int:
+    """Query length of one speculative-decoding verification row.
+
+    A verification step feeds the target one bonus token plus
+    ``num_speculative_tokens`` drafted tokens per request, so every row of a
+    verify batch is ``1 + num_speculative_tokens`` wide.
+
+    Every backend that describes the same batch must draw its decode/prefill
+    boundary here. SparseSWA, the DSA indexer and the DeepSeek V4 sparse-MLA
+    builder all build metadata for the same rows, and the sparse-MLA consumer
+    slices one builder's buffers with another builder's ``num_decode_tokens``
+    (see ``DeepseekV4FlashInferSM120Attention._forward``); a backend that draws
+    the boundary at a different width partitions those shared buffers
+    differently and the two partitions are then mixed.
+
+    This is deliberately *not* the generic parallel-drafting width
+    (``1 + 2 * num_speculative_tokens``), which describes drafters that leave
+    the existing input unshifted. DSpark and DFlash verification do not:
+    ``use_dflash`` and ``uses_draft_model`` are both False for them, so
+    ``max_num_new_slots_for_drafting`` reports ``K - 1`` rather than ``K``, and
+    the target still verifies ``1 + N`` positions.
+    """
+    return 1 + int(num_speculative_tokens)
+
+
 def split_decodes_prefills_and_extends(
     common_attn_metadata: CommonAttentionMetadata,
     decode_threshold: int = 1,

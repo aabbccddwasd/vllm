@@ -7,6 +7,7 @@ import torch
 from tests.v1.attention.test_attention_backends import BATCH_SPECS
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
 from vllm.v1.attention.backends.utils import (
+    spec_decode_verify_query_len,
     split_decodes_and_prefills,
 )
 from vllm.v1.worker.ubatch_utils import (
@@ -460,3 +461,73 @@ def test_build_attention_metadata_zeros_stale_is_prefilling():
     assert not captured_is_prefilling[2]  # decode  (200 >= 200)
     assert not captured_is_prefilling[3]  # stale data (10 < 100) zeroed
     assert not captured_is_prefilling[4]  # stale data (20 < 200) zeroed
+
+
+# --- DeepSeek spec-decode decode/prefill boundary ---------------------------
+#
+# SparseSWA and the DSA indexer describe the same batch, and the sparse-MLA
+# consumer slices the indexer's top-k buffer with SparseSWA's num_decode_tokens
+# (DeepseekV4FlashInferSM120Attention._forward). The two builders must therefore
+# draw the decode/prefill boundary at the same width. DSpark and DFlash
+# verification rows are 1 + N wide; the generic parallel-drafting width (1 + 2N)
+# belongs to drafters that leave the input unshifted.
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [1, 3, 5, 7])
+def test_spec_decode_verify_query_len_is_one_plus_n(num_speculative_tokens):
+    assert (
+        spec_decode_verify_query_len(num_speculative_tokens)
+        == 1 + num_speculative_tokens
+    )
+    assert (
+        spec_decode_verify_query_len(num_speculative_tokens)
+        != 1 + 2 * num_speculative_tokens
+    )
+
+
+def test_spec_decode_verify_query_len_without_speculation():
+    assert spec_decode_verify_query_len(0) == 1
+
+
+def test_boundary_differs_between_verify_width_and_parallel_drafting_width():
+    """Regression for the SparseSWA vs indexer split divergence.
+
+    A batch holding verify rows (1 + N = 6 tokens) plus a short extend of 8
+    tokens is partitioned differently at 1 + N and at 1 + 2N. Before the two
+    builders shared spec_decode_verify_query_len, SparseSWA used 1 + 2N = 11 and
+    put that extend in its decode portion while the indexer used 1 + N = 6 and
+    put it in its prefill portion, so the shared top-k buffer was cut at two
+    different places.
+    """
+    device = torch.device("cpu")
+    query_lens = [6, 6, 8, 300]
+    common_metadata = create_common_attn_metadata(
+        BatchSpec(
+            seq_lens=[600, 600, 700, 900],
+            query_lens=query_lens,
+        ),
+        block_size=16,
+        device=device,
+    )
+
+    def split(decode_threshold: int):
+        return split_decodes_and_prefills(
+            common_metadata,
+            decode_threshold=decode_threshold,
+            require_uniform=False,
+            treat_short_extends_as_decodes=True,
+        )
+
+    num_decodes, _, num_decode_tokens, _ = split(spec_decode_verify_query_len(5))
+    assert (num_decodes, num_decode_tokens) == (2, 12)
+
+    old_swa_decodes, _, old_swa_decode_tokens, _ = split(1 + 2 * 5)
+    assert (old_swa_decodes, old_swa_decode_tokens) == (3, 20)
+
+
+def test_both_builders_use_the_shared_boundary():
+    """The SparseSWA and indexer builders must not re-inline their own width."""
+    from vllm.v1.attention.backends.mla import indexer, sparse_swa
+
+    assert sparse_swa.spec_decode_verify_query_len is spec_decode_verify_query_len
+    assert indexer.spec_decode_verify_query_len is spec_decode_verify_query_len

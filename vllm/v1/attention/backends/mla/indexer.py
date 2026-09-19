@@ -40,6 +40,7 @@ from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_
 from vllm.v1.attention.backends.mla.sparse_utils import request_row_bounds
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
+    spec_decode_verify_query_len,
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import (
@@ -817,7 +818,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         )
         self.indexer_uses_fp4 = dsa_indexer_uses_fp4(self.vllm_config)
 
-        next_n = self.num_speculative_tokens + 1
+        # Shared with SparseSWA: both describe the same batch, and the sparse-MLA
+        # consumer slices this builder's top-k buffer with SparseSWA's
+        # num_decode_tokens.
+        next_n = spec_decode_verify_query_len(self.num_speculative_tokens)
         self.decode_threshold = next_n
         self.reorder_batch_threshold = None
         self.use_flattening = _use_flattening(self.vllm_config)

@@ -30,7 +30,10 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.backends.utils import (
+    spec_decode_verify_query_len,
+    split_decodes_and_prefills,
+)
 from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
@@ -451,19 +454,19 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             self.vllm_config.scheduler_config.max_num_batched_tokens
         )
 
-        # Handle MTP: adjust decode_threshold like the indexer does
+        # Keep the decode/prefill split identical to the DSA indexer, which
+        # describes the same batch. Target verification carries the bonus token
+        # plus N speculative tokens even for parallel drafters such as DSpark, so
+        # the generic parallel-drafting width (1 + 2N) does not apply here: it
+        # would pull short extends of width (1 + N, 1 + 2N] into the decode
+        # portion that the indexer places in its prefill portion.
         spec_config = self.vllm_config.speculative_config
         self.num_speculative_tokens = (
             spec_config.num_speculative_tokens if spec_config else 0
         )
-        # Decode can have query_len up to
-        #   1 + (2 if parallel drafting else 1) * num_speculative_tokens.
-        # sparse_swa has no MQA-vs-dense-MHA routing, so multi-token queries take
-        # the prefill path and the decode/prefill split stays at that width.
-        spec_mult = (
-            2 if (spec_config is not None and spec_config.parallel_drafting) else 1
+        self.decode_threshold = spec_decode_verify_query_len(
+            self.num_speculative_tokens
         )
-        self.decode_threshold = 1 + spec_mult * self.num_speculative_tokens
         self.reorder_batch_threshold = None
 
         hf_config = self.vllm_config.model_config.hf_config
