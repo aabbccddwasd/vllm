@@ -16,6 +16,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.warmup.b12x_warmup import b12x_warmup
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
+from vllm.model_executor.warmup.deepseek_v4_engram_warmup import (
+    deepseek_v4_engram_warmup,
+)
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     resolve_flashinfer_autotune_file,
     write_flashinfer_autotune_cache,
@@ -192,6 +195,14 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
     compilation_config = worker.vllm_config.compilation_config
     cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
+
+    # DSv4.1 Engram row gathers run inside the captured decode graph, so their
+    # first call must not happen while serving. No-op without Engram modules.
+    deepseek_v4_engram_warmup(
+        worker.get_model(),
+        max_tokens=worker.scheduler_config.max_num_batched_tokens,
+        cudagraph_capture_sizes=cudagraph_capture_sizes,
+    )
 
     # Run next so input-prep kernels JIT against pristine runner state.
     if enable_jit_warmup:
